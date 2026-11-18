@@ -4,18 +4,18 @@ services:
     image: ghcr.io/scharret/jimaku-llm:latest
     container_name: subtrans
     restart: unless-stopped
-    user: "1000:1000"            # même UID/GID que Jellyfin/Bazarr sur le dataset
-    env_file: .env               # API_KEY ici, jamais dans le compose
+    user: "1000:1000"            # same UID/GID as Jellyfin/Bazarr on the dataset
+    env_file: .env               # API_KEY lives here, never in the compose file
     environment:
       BACKEND: gemini
-      MODELS: gemini-2.5-flash,gemini-2.5-flash-lite   # repli dans l'ordre
+      MODELS: gemini-2.5-flash,gemini-2.5-flash-lite   # fallback order
       TARGET_LANGS: fr,ja
       FURIGANA: "1"
       LIBRARY_PATHS: /media/Movies:/media/Shows
       BATCH_SIZE: "60"
-      MIN_INTERVAL_S: "4"        # ~15 req/min, compatible offre gratuite
+      MIN_INTERVAL_S: "4"        # ~15 req/min, fits the free tier
       CACHE_DB: /cache/subtrans.db
     volumes:
-      - /mnt/tank/media:/media   # adapte au chemin de ton dataset TrueNAS
+      - /mnt/tank/media:/media   # adjust to your media dataset path
       - ./cache:/cache
     command: ["scan", "--watch", "900"]

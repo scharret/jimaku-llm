@@ -1,11 +1,11 @@
-"""subtrans — traduction de sous-titres .en.srt vers d'autres langues via LLM.
+"""subtrans — translate .en.srt subtitles into other languages with an LLM.
 
 Modes :
-  subtrans file  <chemin.en.srt>        # un fichier (ex. post-processing Bazarr)
-  subtrans scan  [--watch SECONDES]     # parcourt LIBRARY_PATHS
+  subtrans file  <path.en.srt>         # single file (e.g. Bazarr post-processing)
+  subtrans scan  [--watch SECONDES]     # walk LIBRARY_PATHS
 
-Idempotent : ne réécrit jamais une sortie existante (sauf --force).
-Reprise : chaque lot traduit est mis en cache (SQLite), un crash ne coûte que le lot en cours.
+Idempotent: never overwrites an existing output (unless --force).
+Resumable: every translated batch is cached (SQLite); a crash only loses the current batch.
 """
 import argparse
 import hashlib
@@ -45,10 +45,10 @@ CFG = dict(
     batch=env("BATCH_SIZE", 60, int),
     context=env("CONTEXT_CUES", 8, int),
     max_retries=env("MAX_RETRIES", 6, int),
-    min_interval=env("MIN_INTERVAL_S", 1.0, float),   # rate limit simple entre requêtes
+    min_interval=env("MIN_INTERVAL_S", 1.0, float),   # simple rate limit between requests
     cache=env("CACHE_DB", "/cache/subtrans.db"),
     libs=[p for p in env("LIBRARY_PATHS", "/media").split(":") if p],
-    settle=env("SETTLE_S", 120, int),                 # ignore les fichiers modifiés trop récemment
+    settle=env("SETTLE_S", 120, int),                 # skip files modified too recently
     glossary=env("GLOSSARY_FILE", ""),
     timeout=env("HTTP_TIMEOUT_S", 180, int),
 )
@@ -64,7 +64,7 @@ def parse_srt(path):
             continue
         cues.append((int(lines[0].strip()), lines[1].strip(), "\n".join(lines[2:]).strip()))
     if not cues:
-        raise ValueError(f"aucune réplique lisible dans {path}")
+        raise ValueError(f"no readable cue in {path}")
     return cues
 
 
@@ -114,12 +114,12 @@ def _post(url, headers, body):
     try:
         r = requests.post(url, headers=headers, json=body, timeout=CFG["timeout"])
     except requests.RequestException as e:
-        raise RetryableError(f"réseau: {type(e).__name__}") from e
+        raise RetryableError(f"network: {type(e).__name__}") from e
     if r.status_code in RETRYABLE:
         ra = r.headers.get("Retry-After")
         raise RetryableError(f"HTTP {r.status_code}" + (f" retry-after={ra}" if ra else ""))
     if r.status_code >= 400:
-        # pas de dump d'URL/headers : la clé ne doit jamais finir dans les logs
+        # never dump URL/headers: the API key must not end up in logs
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
     return r.json()
 
@@ -136,7 +136,7 @@ def call_llm(model, system, user):
         try:
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError):
-            raise RetryableError(f"réponse vide/bloquée: {str(data)[:200]}")
+            raise RetryableError(f"empty/blocked response: {str(data)[:200]}")
     if b == "openai":  # OpenAI, Ollama, vLLM, LiteLLM, OpenRouter...
         data = _post(f"{CFG['openai_base'].rstrip('/')}/chat/completions",
                      {"Authorization": f"Bearer {CFG['api_key'] or 'none'}"},
@@ -150,10 +150,10 @@ def call_llm(model, system, user):
                      {"model": model, "max_tokens": 8192, "temperature": 0.3, "system": system,
                       "messages": [{"role": "user", "content": user}]})
         return "".join(p.get("text", "") for p in data["content"])
-    if b == "dummy":  # tests sans réseau
+    if b == "dummy":  # offline tests
         items = json.loads(user.split("TRANSLATE:\n", 1)[1])
         return json.dumps({k: f"[{model}] {v}" for k, v in items.items()}, ensure_ascii=False)
-    raise ValueError(f"BACKEND inconnu: {b}")
+    raise ValueError(f"unknown BACKEND: {b}")
 
 
 def parse_json_obj(text):
@@ -162,7 +162,7 @@ def parse_json_obj(text):
     return json.loads(text)
 
 
-# ---------------------------------------------------------------- traduction
+# ---------------------------------------------------------------- translation
 def system_prompt(lang, glossary):
     name = LANG_NAMES.get(lang, lang)
     p = (f"You are a professional subtitle translator. Translate English subtitles into natural, "
@@ -200,24 +200,24 @@ def translate_batch(batch, ctx, lang, glossary, cache):
             try:
                 out = parse_json_obj(call_llm(model, sys_p, user))
                 if set(out) != set(src):
-                    raise RetryableError(f"ids incohérents ({len(out)}/{len(src)})")
+                    raise RetryableError(f"id mismatch ({len(out)}/{len(src)})")
                 out = {k: str(v).replace("\\n", "\n").strip() or src[k] for k, v in out.items()}
                 cache.put(key, out)
                 return out
             except (RetryableError, json.JSONDecodeError) as e:
                 last_err = e
                 delay = min(120, 2 ** attempt * 2) + random.uniform(0, 1.5)
-                log.warning("%s lot %s-%s: %s (essai %d, attente %.0fs)", model, batch[0][0],
+                log.warning("%s batch %s-%s: %s (attempt %d, waiting %.0fs)", model, batch[0][0],
                             batch[-1][0], e, attempt + 1, delay)
                 time.sleep(delay)
-        log.warning("bascule de modèle après échecs sur %s", model)
-    # dernier recours : couper le lot en deux (les gros lots font plus souvent dérailler le JSON)
+        log.warning("falling back to next model after failures on %s", model)
+    # last resort: split the batch in half (large batches break the JSON more often)
     if len(batch) > 8:
         mid = len(batch) // 2
         a = translate_batch(batch[:mid], ctx, lang, glossary, cache)
         tail_ctx = (ctx + [(batch[j][2], a[str(batch[j][0])]) for j in range(mid)])[-CFG["context"]:]
         return {**a, **translate_batch(batch[mid:], tail_ctx, lang, glossary, cache)}
-    raise RuntimeError(f"lot {batch[0][0]}-{batch[-1][0]} intraduisible: {last_err}")
+    raise RuntimeError(f"batch {batch[0][0]}-{batch[-1][0]} failed to translate: {last_err}")
 
 
 def load_glossary(srt_path):
@@ -256,20 +256,20 @@ def process(src, cache, force=False):
     for lang in CFG["targets"]:
         dst = Path(f"{base}.{lang}.srt")
         if dst.exists() and not force:
-            log.debug("déjà présent: %s", dst.name)
+            log.debug("already present: %s", dst.name)
         else:
-            log.info("traduction %s -> %s", src.name, lang)
+            log.info("translating %s -> %s", src.name, lang)
             t0 = time.time()
             cues = translate_file(src, lang, cache)
             write_atomic(dst, render_srt(cues))
-            log.info("écrit %s (%.0fs)", dst.name, time.time() - t0)
+            log.info("wrote %s (%.0fs)", dst.name, time.time() - t0)
             did = True
         if lang == "ja" and CFG["furigana"]:
             ass = Path(f"{base}.ja.ass")
             if dst.exists() and (force or not ass.exists()):
                 from .furigana import cues_to_ass
                 write_atomic(ass, cues_to_ass(parse_srt(dst), title=base.name), encoding="utf-8-sig")
-                log.info("écrit %s", ass.name)
+                log.info("wrote %s", ass.name)
                 did = True
     return did
 
@@ -286,10 +286,10 @@ def scan(cache, force=False):
             try:
                 if process(p, cache, force):
                     n_ok += 1
-            except Exception as e:  # un fichier en échec ne bloque pas le reste
+            except Exception as e:  # one failing file must not block the rest
                 n_err += 1
-                log.error("échec %s: %s", p, e)
-    log.info("scan terminé: %d traité(s), %d échec(s)", n_ok, n_err)
+                log.error("failed %s: %s", p, e)
+    log.info("scan done: %d processed, %d failed", n_ok, n_err)
     return n_err
 
 
@@ -301,18 +301,18 @@ def main(argv=None):
     f.add_argument("path")
     f.add_argument("--force", action="store_true")
     s = sub.add_parser("scan")
-    s.add_argument("--watch", type=int, default=0, help="relance toutes les N secondes")
+    s.add_argument("--watch", type=int, default=0, help="rescan every N seconds")
     s.add_argument("--force", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     if CFG["backend"] != "dummy" and CFG["backend"] != "openai" and not CFG["api_key"]:
-        sys.exit("API_KEY manquante")
+        sys.exit("API_KEY is missing")
     cache = Cache(CFG["cache"])
     if a.cmd == "file":
         p = Path(a.path)
         if not any(p.name.endswith(s) for s in CFG["source_suffixes"]):
-            log.info("ignoré (pas une source %s): %s", CFG["source_suffixes"], p.name)
+            log.info("skipped (not a %s source): %s", CFG["source_suffixes"], p.name)
             return 0
         process(p, cache, a.force)
         return 0

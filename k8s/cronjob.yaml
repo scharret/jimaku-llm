@@ -5,7 +5,7 @@ metadata:
   namespace: media
 spec:
   schedule: "*/30 * * * *"
-  concurrencyPolicy: Forbid          # jamais deux scans en parallèle sur le même cache
+  concurrencyPolicy: Forbid          # never two scans sharing the same cache
   successfulJobsHistoryLimit: 2
   failedJobsHistoryLimit: 3
   jobTemplate:

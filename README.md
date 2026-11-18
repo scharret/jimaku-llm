@@ -1,51 +1,108 @@
 # jimaku-llm (字幕)
 
-Traduit automatiquement les `*.en.srt` d'une bibliothèque Jellyfin en `*.fr.srt` / `*.ja.srt`
-(+ `*.ja.ass` avec furigana), via Gemini, Claude ou n'importe quelle API OpenAI-compatible (Ollama, vLLM, LiteLLM).
+Automatically translates the `*.en.srt` subtitles of a Jellyfin/Plex media library into other languages
+(`*.fr.srt`, `*.ja.srt`, …) with an LLM, and generates a Japanese `*.ja.ass` with **furigana** above every kanji
+— handy for watching anime/films while learning Japanese.
 
-## Comportement
-- **Idempotent** : une sortie existante n'est jamais réécrite (`--force` pour forcer). Un vrai sous-titre FR
-  téléchargé par Bazarr est donc prioritaire.
-- **Reprise** : chaque lot traduit est mis en cache SQLite → un 503 au milieu d'un film ne fait perdre que le lot courant.
-- **Résilience** : backoff exponentiel + jitter sur 408/429/5xx, bascule sur le modèle suivant de `MODELS`,
-  puis découpe du lot en deux si le JSON revient cassé.
-- **Écriture atomique** (`.tmp` + rename) : Jellyfin ne voit jamais un fichier à moitié écrit.
-- Ignore les sources modifiées depuis moins de `SETTLE_S` (Bazarr encore en train d'écrire).
-- Clé API passée en header, jamais dans l'URL → elle ne fuit pas dans les logs.
+Works with Gemini, Claude, or any OpenAI-compatible API (OpenAI, Ollama, vLLM, LiteLLM, OpenRouter).
 
-## Lancer
-```bash
-cp .env.example .env && vi .env           # API_KEY=...
-docker compose up -d --build
-docker compose logs -f
-# one-shot sur un fichier :
-docker compose run --rm subtrans file "/media/Movies/X (1993)/X.en.srt"
+![pipeline](https://img.shields.io/badge/pipeline-.en.srt%20→%20LLM%20→%20.fr.srt%20%2F%20.ja.srt%20%2B%20furigana%20.ass-blue)
+
+## How it works
+
+```
+library scan ──► *.en.srt without *.<lang>.srt
+                    │
+                    ▼
+         batches of ~60 cues + rolling context (previous lines)
+                    │  JSON in / JSON out, ids validated
+                    ▼
+         LLM (Gemini / Claude / OpenAI-compatible)  ◄── SQLite cache (resume)
+                    │
+                    ▼
+         *.fr.srt, *.ja.srt  ──► MeCab/UniDic (fugashi) ──► *.ja.ass with furigana
 ```
 
-## Glossaire (noms propres cohérents)
-`glossary.txt` dans le dossier du film (ou `GLOSSARY_FILE` global) :
+- **Translation** is done by the LLM, with a per-film or global **glossary** to keep names consistent.
+- **Furigana** are *not* LLM-generated: readings come from MeCab + UniDic (deterministic, free, fast),
+  with a small override table for context-dependent words (何 なに/なん, 一日, …). Each reading is placed
+  with `\pos` above its kanji, okurigana excluded.
+
+## Reliability
+
+- **Idempotent**: an existing output is never overwritten (`--force` to redo). A human-made subtitle
+  downloaded by Bazarr always wins.
+- **Resumable**: every translated batch is cached in SQLite — a 503 halfway through a film only costs the current batch.
+- **Resilient**: exponential backoff + jitter on 408/429/5xx, fallback to the next model in `MODELS`,
+  then batch bisection if the model keeps returning broken JSON.
+- **Atomic writes** (`.tmp` + rename): the media server never sees a half-written file.
+- Ignores sources modified less than `SETTLE_S` ago (Bazarr still writing).
+- The API key is sent as a header, never in the URL, so it does not leak into proxy/app logs.
+
+## Quick start (Docker Compose)
+
+```bash
+cp .env.example .env && $EDITOR .env      # API_KEY=...
+$EDITOR docker-compose.yml                 # set your media volume
+docker compose pull
+# try a single file first
+docker compose run --rm subtrans file "/media/Movies/X (1993)/X.en.srt" -v
+# then run as a service (rescans every 15 min)
+docker compose up -d
+```
+
+## Kubernetes
+
+`k8s/cronjob.yaml` runs a scan every 30 minutes (`concurrencyPolicy: Forbid`), media over NFS, API key from a Secret:
+
+```bash
+kubectl -n media create secret generic subtrans-api --from-literal=API_KEY=...
+kubectl apply -f k8s/cronjob.yaml
+```
+
+## Glossary
+
+`glossary.txt` in the film folder (or a global one via `GLOSSARY_FILE`):
+
 ```
 Burikin Hotel => ブリキンホテル / Hôtel Burikin
 Bamboo copter => タケコプター / hélicoptère de bambou
 ```
 
-## Variables
-| Var | Défaut | |
+## Configuration
+
+| Variable | Default | Notes |
 |---|---|---|
-| `BACKEND` | `gemini` | `gemini` \| `anthropic` \| `openai` \| `dummy` |
-| `MODELS` | `gemini-2.5-flash` | liste ordonnée, repli |
-| `OPENAI_BASE_URL` | `http://ollama:11434/v1` | pour `openai` |
+| `BACKEND` | `gemini` | `gemini` \| `anthropic` \| `openai` \| `dummy` (offline tests) |
+| `API_KEY` | — | not needed for a local OpenAI-compatible server |
+| `MODELS` | `gemini-2.5-flash` | comma-separated, tried in order |
+| `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
 | `SOURCE_SUFFIXES` | `.en.srt,.eng.srt` | |
-| `FURIGANA` | `1` | génère `.ja.ass` |
+| `FURIGANA` | `1` | generate `.ja.ass` |
 | `BATCH_SIZE` / `CONTEXT_CUES` | `60` / `8` | |
-| `MAX_RETRIES` / `MIN_INTERVAL_S` | `6` / `1.0` | |
-| `LIBRARY_PATHS` | `/media` | séparés par `:` |
+| `MAX_RETRIES` / `MIN_INTERVAL_S` | `6` / `1.0` | per model / seconds between requests |
+| `LIBRARY_PATHS` | `/media` | `:`-separated |
+| `SETTLE_S` | `120` | |
+| `CACHE_DB` | `/cache/subtrans.db` | |
+
+## Playback notes
+
+- Jellyfin web/desktop renders ASS client-side: enable **fallback fonts** (Dashboard → Playback) and drop a
+  Japanese font there, e.g. `NotoSansCJKjp-Regular.otf` (not the `.ttc`).
+- TV clients often ignore ASS positioning: set subtitles to **burn-in** for this track, or use mpv / Jellyfin Media Player.
 
 ## Image
-`ghcr.io/scharret/jimaku-llm` (amd64/arm64), construite par la CI à chaque push sur `main` et sur les tags `v*`.
 
-## Tests
+`ghcr.io/scharret/jimaku-llm` (amd64/arm64), built by CI on every push to `main` and on `v*` tags.
+
+## Development
+
 ```bash
 pip install requests "fugashi[unidic-lite]" pytest && pytest -q
 ```
+
+## Disclaimer
+
+Machine translation: good enough to follow a film, not a substitute for official subtitles.
+Translate only subtitles you have the right to use.

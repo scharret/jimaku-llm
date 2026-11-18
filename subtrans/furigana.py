@@ -1,11 +1,11 @@
-"""SRT japonais -> ASS avec furigana positionnés (\\pos) au-dessus des kanji."""
+"""Japanese SRT -> ASS with furigana positioned (\\pos) above each kanji."""
 import unicodedata
 
 import fugashi
 
 _TAGGER = None
 
-# Corrections de lecture que unidic rate souvent (hors contexte).
+# Reading fixes for words unidic often gets wrong out of context.
 OVERRIDES = {
     "泳": "およ", "一日": "いちにち", "何時": "なんじ", "日本": "にほん",
     "私": "わたし", "野比": "のび", "何者": "なにもの", "冥界": "めいかい",
@@ -52,13 +52,13 @@ def _width(c):
 
 
 def ruby_segments(line):
-    """[(texte, lecture|None)] avec okurigana séparés de la partie kanji."""
+    """[(text, reading|None)] with okurigana split from the kanji part."""
     segs = []
     toks = list(_tagger()(line))
     for i, m in enumerate(toks):
         s = m.surface
         r = OVERRIDES.get(s) or _hira(m.feature.kana or "")
-        if s == "何":  # なに / なん selon ce qui suit
+        if s == "何":  # なに vs なん depending on what follows
             nx = toks[i + 1].surface if i + 1 < len(toks) else ""
             r = "なん" if (nx[:1] in "でだのと度泊日百千" or nx.startswith("キロ")) else "なに"
         if not any(_is_kanji(c) for c in s) or not r:
