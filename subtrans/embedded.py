@@ -1,4 +1,4 @@
-"""Extract an embedded English text subtitle track from a video container (mkv/mp4) with ffmpeg."""
+"""Inspect video containers (mkv/mp4) with ffprobe and extract embedded text subtitle tracks with ffmpeg."""
 import json
 import logging
 import os
@@ -11,48 +11,107 @@ TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
 IMAGE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
 SKIP_TITLE_WORDS = ("sign", "song", "forced", "karaoke", "commentary")
 
+# ISO 639-1 / 639-2 (B and T) codes and common names, all lowercase.
+LANG_ALIASES = {
+    "en": {"en", "eng", "english"},
+    "fr": {"fr", "fre", "fra", "french", "francais", "français"},
+    "ja": {"ja", "jpn", "jp", "japanese"},
+    "es": {"es", "spa", "spanish"},
+    "de": {"de", "ger", "deu", "german"},
+    "it": {"it", "ita", "italian"},
+}
 
-def probe_subs(video: Path):
+
+def aliases(lang):
+    lang = lang.lower()
+    for codes in LANG_ALIASES.values():
+        if lang in codes:
+            return codes
+    return {lang}
+
+
+def normalize(code):
+    """'jpn' -> 'ja', 'fre' -> 'fr', unknown codes unchanged."""
+    code = (code or "").lower()
+    for short, codes in LANG_ALIASES.items():
+        if code in codes:
+            return short
+    return code
+
+
+def probe(video: Path):
+    """All audio and subtitle streams of a video, as returned by ffprobe."""
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "s",
-         "-show_entries", "stream=index,codec_name:stream_tags=language,title:stream_disposition=forced,hearing_impaired",
+        ["ffprobe", "-v", "error",
+         "-show_entries",
+         "stream=index,codec_type,codec_name:stream_tags=language,title"
+         ":stream_disposition=default,forced,hearing_impaired",
          "-of", "json", str(video)],
         capture_output=True, text=True, timeout=120, check=True)
-    return json.loads(out.stdout).get("streams", [])
+    return [s for s in json.loads(out.stdout).get("streams", [])
+            if s.get("codec_type") in ("audio", "subtitle")]
 
 
-def pick_english_track(streams, languages=("eng", "en")):
-    """Best English text track: not forced, not signs/songs, SubRip preferred, non-SDH preferred."""
-    def tags(s):
-        return s.get("tags", {}) or {}
+def _tags(s):
+    return s.get("tags", {}) or {}
 
-    eng = [s for s in streams if (tags(s).get("language") or "").lower() in languages]
-    text = [s for s in eng if s.get("codec_name") in TEXT_CODECS]
+
+def _disp(s):
+    return s.get("disposition", {}) or {}
+
+
+def stream_lang(s):
+    return normalize(_tags(s).get("language"))
+
+
+def audio_langs(streams):
+    return {stream_lang(s) for s in streams if s.get("codec_type") == "audio"}
+
+
+def full_text_sub_langs(streams):
+    """Languages that already have a complete (non-forced, text) subtitle track in the container."""
+    return {stream_lang(s) for s in streams
+            if s.get("codec_type") == "subtitle" and s.get("codec_name") in TEXT_CODECS
+            and not _disp(s).get("forced")
+            and not any(w in (_tags(s).get("title") or "").lower() for w in SKIP_TITLE_WORDS)}
+
+
+def pick_text_track(streams, lang):
+    """Best full text track in `lang`: not forced, not signs/songs, SubRip first, plain before SDH."""
+    codes = aliases(lang)
+    subs = [s for s in streams if s.get("codec_type", "subtitle") == "subtitle"
+            and (_tags(s).get("language") or "").lower() in codes]
+    text = [s for s in subs if s.get("codec_name") in TEXT_CODECS]
     if not text:
-        if any(s.get("codec_name") in IMAGE_CODECS for s in eng):
-            log.info("only image-based English subs (PGS/VobSub): OCR not supported, skipping")
+        if any(s.get("codec_name") in IMAGE_CODECS for s in subs):
+            log.info("only image-based %s subs (PGS/VobSub): OCR not supported, skipping", lang)
         return None
     usable = [s for s in text
-              if not (s.get("disposition", {}) or {}).get("forced")
-              and not any(w in (tags(s).get("title") or "").lower() for w in SKIP_TITLE_WORDS)]
+              if not _disp(s).get("forced")
+              and not any(w in (_tags(s).get("title") or "").lower() for w in SKIP_TITLE_WORDS)]
     if not usable:
         return None
     usable.sort(key=lambda s: (
-        s.get("codec_name") not in ("subrip", "srt"),            # SubRip first (ASS carries signs/karaoke noise)
-        bool((s.get("disposition", {}) or {}).get("hearing_impaired")),  # plain over SDH
+        s.get("codec_name") not in ("subrip", "srt"),   # SubRip first (ASS carries signs/karaoke noise)
+        bool(_disp(s).get("hearing_impaired")),         # plain over SDH
         s["index"]))
     return usable[0]
 
 
-def extract_english_srt(video: Path, dest: Path):
-    """Write the chosen track to dest as SRT. Returns True on success, False if no usable track."""
-    track = pick_english_track(probe_subs(video))
+def pick_english_track(streams, languages=None):
+    """Kept for backward compatibility."""
+    return pick_text_track(streams, "en")
+
+
+def extract_srt(video: Path, dest: Path, lang, streams=None):
+    """Write the best `lang` text track to dest as SRT. Returns True on success, False if none usable."""
+    track = pick_text_track(streams if streams is not None else probe(video), lang)
     if track is None:
         return False
     tmp = Path(str(dest) + ".tmp.srt")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    log.info("extracting embedded subtitle stream #%s (%s) from %s",
-             track["index"], track.get("codec_name"), video.name)
+    log.info("extracting embedded %s subtitle stream #%s (%s) from %s",
+             lang, track["index"], track.get("codec_name"), video.name)
     subprocess.run(
         ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(video),
          "-map", f"0:{track['index']}", "-c:s", "srt", str(tmp)],
@@ -62,3 +121,8 @@ def extract_english_srt(video: Path, dest: Path):
         return False
     os.replace(tmp, dest)
     return True
+
+
+def extract_english_srt(video: Path, dest: Path):
+    """Kept for backward compatibility."""
+    return extract_srt(video, dest, "en")

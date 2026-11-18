@@ -1,13 +1,18 @@
 """subtrans — translate English subtitles into other languages with an LLM.
 
-Sources, in order: an external <video>.en.srt / .eng.srt, else the embedded English
-text track of the video (extracted with ffmpeg; image-based PGS/VobSub are skipped).
+For every video under LIBRARY_PATHS:
+  1. skip it unless it has an audio track in REQUIRE_AUDIO_LANGS (default: Japanese);
+  2. for each TARGET_LANGS language, skip it if subtitles already exist, either next to
+     the video (X.fr.srt, X.fre.srt, X.fra.hi.srt...) or embedded as a text track;
+  3. otherwise translate the English source: an external X.en.srt, else the embedded
+     English text track (extracted with ffmpeg; image-based PGS/VobSub are skipped);
+  4. build X.ja.ass with furigana, preferring real Japanese subtitles over our translation.
 
 Modes:
-  subtrans file  <video|path.en.srt>    # single item (e.g. Bazarr/Radarr post-processing)
-  subtrans scan  [--watch SECONDS]      # walk LIBRARY_PATHS for video files
+  subtrans file  <video|subtitle>       # single item (e.g. Bazarr/Radarr post-processing)
+  subtrans scan  [--watch SECONDS]      # walk LIBRARY_PATHS
 
-Idempotent: never overwrites an existing output (unless --force).
+Idempotent: never overwrites an existing output (unless --force, which only rewrites our own files).
 Resumable: every translated batch is cached (SQLite); a crash only loses the current batch.
 """
 import argparse
@@ -43,7 +48,6 @@ CFG = dict(
     api_key=env("API_KEY", ""),
     openai_base=env("OPENAI_BASE_URL", "http://ollama:11434/v1"),
     targets=[t.strip() for t in env("TARGET_LANGS", "fr,ja").split(",") if t.strip()],
-    source_suffixes=[s.strip() for s in env("SOURCE_SUFFIXES", ".en.srt,.eng.srt").split(",")],
     furigana=env("FURIGANA", "1") == "1",
     batch=env("BATCH_SIZE", 60, int),
     context=env("CONTEXT_CUES", 8, int),
@@ -56,6 +60,8 @@ CFG = dict(
     timeout=env("HTTP_TIMEOUT_S", 180, int),
     extract_embedded=env("EXTRACT_EMBEDDED", "1") == "1",
     keep_extracted=env("KEEP_EXTRACTED", "0") == "1",   # 1 = also write <video>.en.srt next to the video
+    # Only process videos having an audio track in one of these languages ("" = no filter).
+    require_audio=[x.strip() for x in env("REQUIRE_AUDIO_LANGS", "ja").split(",") if x.strip()],
     video_exts=[e.strip().lower() for e in env("VIDEO_EXTS", ".mkv,.mp4,.m4v,.avi").split(",")],
 )
 
@@ -267,79 +273,166 @@ def translate_file(src_path, lang, cache):
 
 
 # ---------------------------------------------------------------- orchestration
+SUB_EXTS = {".srt", ".ass", ".ssa", ".vtt"}
+
+
 def pending_outputs(base: Path, force=False):
+    """Our own output files that do not exist yet (cheap check, no ffprobe)."""
     out = [Path(f"{base}.{lang}.srt") for lang in CFG["targets"]]
     if "ja" in CFG["targets"] and CFG["furigana"]:
         out.append(Path(f"{base}.ja.ass"))
     return out if force else [o for o in out if not o.exists()]
 
 
-def find_source(base: Path, video: Path | None, cache: Cache):
-    """External English SRT next to the video, else the embedded track extracted with ffmpeg."""
-    for suf in CFG["source_suffixes"]:
-        ext = Path(f"{base}{suf}")
-        if ext.exists():
-            return ext
-    if not (video and CFG["extract_embedded"]):
+def external_subs(base: Path):
+    """{lang: [paths]} of full (non-forced) subtitle files next to the video.
+
+    Understands Bazarr/Radarr naming: X.fr.srt, X.fre.srt, X.fra.hi.srt, X.ja.ass, ...
+    """
+    from .embedded import LANG_ALIASES, normalize
+    found = {}
+    prefix = base.name + "."
+    try:
+        entries = list(base.parent.iterdir())
+    except FileNotFoundError:
+        return found
+    for f in entries:
+        if not f.name.startswith(prefix) or f.suffix.lower() not in SUB_EXTS:
+            continue
+        tokens = f.name[len(prefix):-len(f.suffix)].lower().split(".")
+        if "forced" in tokens:
+            continue  # forced tracks only cover foreign-language parts
+        lang = next((normalize(t) for t in tokens if normalize(t) in LANG_ALIASES), None)
+        if lang:
+            found.setdefault(lang, []).append(f)
+    for paths in found.values():  # exact "X.<lang>.srt" first, SDH/HI variants last
+        paths.sort(key=lambda f: (f.suffix.lower() != ".srt", len(f.name)))
+    return found
+
+
+def probe_cached(video: Path, cache: Cache):
+    """ffprobe streams, cached by path/size/mtime so rescans don't touch the NAS."""
+    from .embedded import probe
+    st = video.stat()
+    key = f"probe:{video}:{st.st_size}:{int(st.st_mtime)}"
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        streams = probe(video)
+    except Exception as e:  # corrupt/partial file: skip it, retry when it changes
+        log.warning("ffprobe failed on %s: %s", video.name, e)
+        streams = None
+    cache.put(key, streams)
+    return streams
+
+
+def extracted_path(video: Path, base: Path, lang):
+    if CFG["keep_extracted"] and lang == "en":
+        return Path(f"{base}.en.srt")
+    h = hashlib.sha1(str(video).encode()).hexdigest()[:16]
+    return Path(CFG["cache"]).parent / "extracted" / f"{h}.{lang}.srt"
+
+
+def find_srt(lang, base: Path, video: Path | None, streams, ext, cache: Cache):
+    """An SRT in `lang`: external file first, else the embedded text track (extracted with ffmpeg)."""
+    for f in ext.get(lang, []):
+        if f.suffix.lower() == ".srt":
+            return f
+    if not (video and streams and CFG["extract_embedded"]):
         return None
     st = video.stat()
-    neg_key = f"noembed:{video}:{st.st_size}:{int(st.st_mtime)}"
+    neg_key = f"noembed:{lang}:{video}:{st.st_size}:{int(st.st_mtime)}"
     if cache.get(neg_key):
         return None  # already probed, nothing usable: don't re-read a multi-GB file every scan
-    if CFG["keep_extracted"]:
-        dest = Path(f"{base}.en.srt")
-    else:
-        h = hashlib.sha1(str(video).encode()).hexdigest()[:16]
-        dest = Path(CFG["cache"]).parent / "extracted" / f"{h}.en.srt"
+    dest = extracted_path(video, base, lang)
     if dest.exists() and dest.stat().st_mtime >= st.st_mtime:
         return dest
-    from .embedded import extract_english_srt
-    if extract_english_srt(video, dest):
+    from .embedded import extract_srt
+    if extract_srt(video, dest, lang, streams):
         return dest
     cache.put(neg_key, True)
-    log.info("no usable English subtitle in %s", video.name)
     return None
 
 
-def process(base: Path, src: Path, cache, force=False):
-    did = False
-    for lang in CFG["targets"]:
-        dst = Path(f"{base}.{lang}.srt")
-        if dst.exists() and not force:
-            log.debug("already present: %s", dst.name)
-        else:
-            log.info("translating %s -> %s", base.name, lang)
-            t0 = time.time()
-            cues = translate_file(src, lang, cache)
-            write_atomic(dst, render_srt(cues))
-            log.info("wrote %s (%.0fs)", dst.name, time.time() - t0)
-            did = True
-        if lang == "ja" and CFG["furigana"]:
-            ass = Path(f"{base}.ja.ass")
-            if dst.exists() and (force or not ass.exists()):
-                from .furigana import cues_to_ass
-                write_atomic(ass, cues_to_ass(parse_srt(dst), title=base.name), encoding="utf-8-sig")
-                log.info("wrote %s", ass.name)
-                did = True
-    return did
+def resolve(path: Path):
+    """(base, video) for a video file or a subtitle file such as X.en.srt / X.eng.hi.srt."""
+    from .embedded import LANG_ALIASES, normalize
+    if path.suffix.lower() in CFG["video_exts"]:
+        return path.with_suffix(""), path
+    if path.suffix.lower() not in SUB_EXTS:
+        return None, None
+    parts = path.name.split(".")[:-1]
+    idx = next((i for i in range(len(parts) - 1, 0, -1) if normalize(parts[i]) in LANG_ALIASES), None)
+    if idx is None:
+        return None, None
+    base = path.with_name(".".join(parts[:idx]))
+    video = next((Path(f"{base}{e}") for e in CFG["video_exts"] if Path(f"{base}{e}").exists()), None)
+    return base, video
 
 
 def handle(path: Path, cache, force=False):
-    """path: a video file or an English .srt. Returns True if something was written."""
-    if path.suffix.lower() in CFG["video_exts"]:
-        base, video = path.with_suffix(""), path
-    else:
-        suf = next((s for s in CFG["source_suffixes"] if path.name.endswith(s)), None)
-        if not suf:
-            log.info("skipped (not a video nor a %s source): %s", CFG["source_suffixes"], path.name)
-            return False
-        base, video = path.with_name(path.name[: -len(suf)]), None
+    """Decide what a video needs and do it. Returns True if something was written."""
+    from .embedded import audio_langs, full_text_sub_langs, normalize
+    base, video = resolve(path)
+    if base is None:
+        log.info("skipped (not a video nor a subtitle file): %s", path.name)
+        return False
     if not pending_outputs(base, force):
+        return False  # everything we would produce already exists
+
+    streams = probe_cached(video, cache) if video else []
+    if video and streams is None:
         return False
-    src = find_source(base, video, cache)
-    if src is None:
-        return False
-    return process(base, src, cache, force)
+    wanted_audio = {normalize(x) for x in CFG["require_audio"]}
+    if video and wanted_audio:
+        found = audio_langs(streams)
+        if not found & wanted_audio:
+            log.debug("skipped %s: no %s audio (found: %s)", video.name,
+                      "/".join(sorted(wanted_audio)), ", ".join(sorted(found)) or "untagged")
+            return False
+
+    ext = external_subs(base)
+    embedded = full_text_sub_langs(streams)
+    did = False
+
+    todo = []
+    for lang in CFG["targets"]:
+        own = Path(f"{base}.{lang}.srt")
+        others = [f for f in ext.get(lang, []) if f != own]
+        if lang in embedded or others:
+            log.debug("%s: %s subtitles already available, not translating", base.name, lang)
+            continue
+        if force or not own.exists():
+            todo.append(lang)
+
+    if todo:
+        src = find_srt("en", base, video, streams, ext, cache)
+        if src is None:
+            log.info("no usable English subtitle for %s", base.name)
+        else:
+            for lang in todo:
+                dst = Path(f"{base}.{lang}.srt")
+                log.info("translating %s -> %s", base.name, lang)
+                t0 = time.time()
+                cues = translate_file(src, lang, cache)
+                write_atomic(dst, render_srt(cues))
+                log.info("wrote %s (%.0fs)", dst.name, time.time() - t0)
+                did = True
+
+    if "ja" in CFG["targets"] and CFG["furigana"]:
+        ass = Path(f"{base}.ja.ass")
+        if force or not ass.exists():
+            # Prefer real Japanese subtitles (embedded or external) over our own translation.
+            ext = external_subs(base)
+            ja_src = find_srt("ja", base, video, streams, ext, cache)
+            if ja_src:
+                from .furigana import cues_to_ass
+                write_atomic(ass, cues_to_ass(parse_srt(ja_src), title=base.name), encoding="utf-8-sig")
+                log.info("wrote %s (from %s)", ass.name,
+                         "embedded track" if ja_src.parent != base.parent else ja_src.name)
+                did = True
+    return did
 
 
 def scan(cache, force=False):
@@ -365,7 +458,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="subtrans")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    f = sub.add_parser("file", help="process one video file or one English .srt")
+    f = sub.add_parser("file", help="process one video file or one subtitle file")
     f.add_argument("path")
     f.add_argument("--force", action="store_true")
     s = sub.add_parser("scan", help="walk LIBRARY_PATHS for video files")

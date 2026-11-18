@@ -10,6 +10,7 @@ services:
       BACKEND: gemini
       MODELS: gemini-3.8-flash,gemini-3.5-flash-lite   # fallback order
       TARGET_LANGS: fr,ja
+      REQUIRE_AUDIO_LANGS: ja      # only Japanese-audio videos
       FURIGANA: "1"
       LIBRARY_PATHS: /media/Movies:/media/Shows
       BATCH_SIZE: "60"
