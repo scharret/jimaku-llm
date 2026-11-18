@@ -110,7 +110,7 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 
 ## Image
 
-`ghcr.io/scharret/jimaku-llm` (amd64/arm64), built by CI on every push to `main` and on `v*` tags.
+`ghcr.io/scharret/jimaku-llm`, built by CI: `latest` and `sha-*` (amd64) on every push to `main`; semver tags (amd64 + arm64) on `v*` tags.
 
 ## Development
 
