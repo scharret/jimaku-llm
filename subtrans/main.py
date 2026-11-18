@@ -39,7 +39,7 @@ def env(name, default=None, cast=str):
 
 CFG = dict(
     backend=env("BACKEND", "gemini"),                 # gemini | openai | anthropic | dummy
-    models=[m.strip() for m in env("MODELS", "gemini-2.5-flash").split(",") if m.strip()],
+    models=[m.strip() for m in env("MODELS", "gemini-3.8-flash").split(",") if m.strip()],
     api_key=env("API_KEY", ""),
     openai_base=env("OPENAI_BASE_URL", "http://ollama:11434/v1"),
     targets=[t.strip() for t in env("TARGET_LANGS", "fr,ja").split(",") if t.strip()],
@@ -105,6 +105,13 @@ class RetryableError(Exception):
     pass
 
 
+class ModelUnavailable(Exception):
+    """The model does not exist or is not offered to this account (HTTP 404): skip it for good."""
+
+
+_dead_models = set()
+
+
 _last_call = [0.0]
 
 
@@ -124,6 +131,8 @@ def _post(url, headers, body):
     if r.status_code in RETRYABLE:
         ra = r.headers.get("Retry-After")
         raise RetryableError(f"HTTP {r.status_code}" + (f" retry-after={ra}" if ra else ""))
+    if r.status_code == 404:
+        raise ModelUnavailable(f"HTTP 404: {r.text[:300]}")
     if r.status_code >= 400:
         # never dump URL/headers: the API key must not end up in logs
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
@@ -202,6 +211,8 @@ def translate_batch(batch, ctx, lang, glossary, cache):
             + "\n\nTRANSLATE:\n" + json.dumps(src, ensure_ascii=False))
     last_err = None
     for model in CFG["models"]:
+        if model in _dead_models:
+            continue
         for attempt in range(CFG["max_retries"]):
             try:
                 out = parse_json_obj(call_llm(model, sys_p, user))
@@ -210,13 +221,21 @@ def translate_batch(batch, ctx, lang, glossary, cache):
                 out = {k: str(v).replace("\\n", "\n").strip() or src[k] for k, v in out.items()}
                 cache.put(key, out)
                 return out
+            except ModelUnavailable as e:
+                _dead_models.add(model)
+                last_err = e
+                log.error("model %s unavailable, disabling it for this run: %s", model, e)
+                break
             except (RetryableError, json.JSONDecodeError) as e:
                 last_err = e
                 delay = min(120, 2 ** attempt * 2) + random.uniform(0, 1.5)
                 log.warning("%s batch %s-%s: %s (attempt %d, waiting %.0fs)", model, batch[0][0],
                             batch[-1][0], e, attempt + 1, delay)
                 time.sleep(delay)
-        log.warning("falling back to next model after failures on %s", model)
+        if model not in _dead_models:
+            log.warning("falling back to next model after failures on %s", model)
+    if all(m in _dead_models for m in CFG["models"]):
+        raise RuntimeError(f"no usable model in MODELS={CFG['models']}: {last_err}")
     # last resort: split the batch in half (large batches break the JSON more often)
     if len(batch) > 8:
         mid = len(batch) // 2
