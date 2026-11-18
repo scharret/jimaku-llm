@@ -88,7 +88,7 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 |---|---|---|
 | `BACKEND` | `gemini` | `gemini` \| `anthropic` \| `openai` \| `dummy` (offline tests) |
 | `API_KEY` | — | not needed for a local OpenAI-compatible server |
-| `MODELS` | `gemini-2.5-flash` | comma-separated, tried in order |
+| `MODELS` | `gemini-3.8-flash` | comma-separated, tried in order |
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
 | `SOURCE_SUFFIXES` | `.en.srt,.eng.srt` | external sources |

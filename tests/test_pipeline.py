@@ -110,3 +110,37 @@ def test_embedded_extraction(tmp_path, monkeypatch):
     fr = m.parse_srt(d / "Film.fr.srt")
     assert len(fr) == 4 and "Doraemon" in fr[1][2]
     assert not (d / "Film.en.srt").exists()   # extracted copy stays in the cache dir
+
+
+def test_unavailable_model_is_skipped(tmp_path, monkeypatch):
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    monkeypatch.setattr(m, "_dead_models", set())
+    p = setup(tmp_path)
+    real, calls = m.call_llm, []
+
+    def gone(model, s, u):
+        calls.append(model)
+        if model == "a":
+            raise m.ModelUnavailable("HTTP 404: model retired")
+        return real(model, s, u)
+
+    monkeypatch.setattr(m, "call_llm", gone)
+    cache = m.Cache(m.CFG["cache"])
+    cues = m.parse_srt(p)
+    assert m.translate_batch(cues[:2], [], "fr", "", cache)["1"].startswith("[b]")
+    assert m.translate_batch(cues[2:], [], "fr", "", cache)["3"].startswith("[b]")
+    assert calls == ["a", "b", "b"]   # 404 is not retried, and the dead model is not tried again
+
+
+def test_all_models_unavailable_fails_fast(tmp_path, monkeypatch):
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    monkeypatch.setattr(m, "_dead_models", set())
+    p = setup(tmp_path)
+
+    def gone(model, s, u):
+        raise m.ModelUnavailable("HTTP 404")
+
+    monkeypatch.setattr(m, "call_llm", gone)
+    import pytest
+    with pytest.raises(RuntimeError, match="no usable model"):
+        m.translate_batch(m.parse_srt(p), [], "fr", "", m.Cache(m.CFG["cache"]))
