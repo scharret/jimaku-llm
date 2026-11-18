@@ -32,6 +32,7 @@ def setup(tmp_path):
     d.mkdir(parents=True)
     p = d / "Film.en.srt"
     p.write_text(SRT, encoding="utf-8")
+    (d / "Film.mkv").write_bytes(b"")
     return p
 
 
@@ -39,13 +40,14 @@ def test_scan_writes_outputs_and_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setattr(m.time, "sleep", lambda s: None)
     p = setup(tmp_path)
     cache = m.Cache(m.CFG["cache"])
-    assert m.process(p, cache) is True
+    assert m.handle(p, cache) is True
     fr = m.parse_srt(p.with_name("Film.fr.srt"))
     assert [c[0] for c in fr] == [1, 2, 3, 4]
     assert fr[1][1] == "00:00:03,000 --> 00:00:04,000"
     assert fr[1][2].count("\n") == 1
     assert p.with_name("Film.ja.ass").read_text(encoding="utf-8-sig").startswith("[Script Info]")
-    assert m.process(p, cache) is False
+    assert m.handle(p, cache) is False
+    assert m.scan(cache) == 0
 
 
 def test_retry_then_fallback_model(tmp_path, monkeypatch):
@@ -73,3 +75,38 @@ def test_furigana_okurigana():
     assert "".join(s for s, _ in segs) == "家に帰った"
     assert ("何", "なに") in ruby_segments("何してるの")
     assert ("何", "なん") in ruby_segments("何度も")
+
+
+def test_pick_english_track():
+    from subtrans.embedded import pick_english_track
+    streams = [
+        {"index": 2, "codec_name": "ass", "tags": {"language": "eng", "title": "Signs & Songs"}},
+        {"index": 3, "codec_name": "hdmv_pgs_subtitle", "tags": {"language": "eng"}},
+        {"index": 4, "codec_name": "ass", "tags": {"language": "eng", "title": "Full"}},
+        {"index": 5, "codec_name": "subrip", "tags": {"language": "eng", "title": "SDH"},
+         "disposition": {"hearing_impaired": 1}},
+        {"index": 6, "codec_name": "subrip", "tags": {"language": "jpn"}},
+        {"index": 7, "codec_name": "subrip", "tags": {"language": "eng"}, "disposition": {"forced": 1}},
+    ]
+    assert pick_english_track(streams)["index"] == 5          # subrip beats ass, even SDH
+    assert pick_english_track(streams[:3])["index"] is not None
+    assert pick_english_track([streams[1]]) is None            # image-only
+
+
+def test_embedded_extraction(tmp_path, monkeypatch):
+    import shutil, subprocess
+    if not shutil.which("ffmpeg"):
+        import pytest; pytest.skip("ffmpeg not installed")
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    m.CFG["cache"] = str(tmp_path / "cache" / "c.db")
+    d = tmp_path / "lib" / "Film"; d.mkdir(parents=True)
+    srt = tmp_path / "in.srt"; srt.write_text(SRT, encoding="utf-8")
+    video = d / "Film.mkv"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=9",
+                    "-i", str(srt), "-map", "0", "-map", "1", "-c:v", "libx264", "-c:s", "srt",
+                    "-metadata:s:s:0", "language=eng", str(video)], check=True)
+    cache = m.Cache(m.CFG["cache"])
+    assert m.handle(video, cache) is True
+    fr = m.parse_srt(d / "Film.fr.srt")
+    assert len(fr) == 4 and "Doraemon" in fr[1][2]
+    assert not (d / "Film.en.srt").exists()   # extracted copy stays in the cache dir

@@ -1,8 +1,11 @@
-"""subtrans — translate .en.srt subtitles into other languages with an LLM.
+"""subtrans — translate English subtitles into other languages with an LLM.
 
-Modes :
-  subtrans file  <path.en.srt>         # single file (e.g. Bazarr post-processing)
-  subtrans scan  [--watch SECONDES]     # walk LIBRARY_PATHS
+Sources, in order: an external <video>.en.srt / .eng.srt, else the embedded English
+text track of the video (extracted with ffmpeg; image-based PGS/VobSub are skipped).
+
+Modes:
+  subtrans file  <video|path.en.srt>    # single item (e.g. Bazarr/Radarr post-processing)
+  subtrans scan  [--watch SECONDS]      # walk LIBRARY_PATHS for video files
 
 Idempotent: never overwrites an existing output (unless --force).
 Resumable: every translated batch is cached (SQLite); a crash only loses the current batch.
@@ -51,6 +54,9 @@ CFG = dict(
     settle=env("SETTLE_S", 120, int),                 # skip files modified too recently
     glossary=env("GLOSSARY_FILE", ""),
     timeout=env("HTTP_TIMEOUT_S", 180, int),
+    extract_embedded=env("EXTRACT_EMBEDDED", "1") == "1",
+    keep_extracted=env("KEEP_EXTRACTED", "0") == "1",   # 1 = also write <video>.en.srt next to the video
+    video_exts=[e.strip().lower() for e in env("VIDEO_EXTS", ".mkv,.mp4,.m4v,.avi").split(",")],
 )
 
 
@@ -242,23 +248,48 @@ def translate_file(src_path, lang, cache):
 
 
 # ---------------------------------------------------------------- orchestration
-def outputs_for(src: Path):
-    name = src.name
-    suf = next(s for s in CFG["source_suffixes"] if name.endswith(s))
-    base = src.with_name(name[: -len(suf)])
-    return base
+def pending_outputs(base: Path, force=False):
+    out = [Path(f"{base}.{lang}.srt") for lang in CFG["targets"]]
+    if "ja" in CFG["targets"] and CFG["furigana"]:
+        out.append(Path(f"{base}.ja.ass"))
+    return out if force else [o for o in out if not o.exists()]
 
 
-def process(src, cache, force=False):
-    src = Path(src)
-    base = outputs_for(src)
+def find_source(base: Path, video: Path | None, cache: Cache):
+    """External English SRT next to the video, else the embedded track extracted with ffmpeg."""
+    for suf in CFG["source_suffixes"]:
+        ext = Path(f"{base}{suf}")
+        if ext.exists():
+            return ext
+    if not (video and CFG["extract_embedded"]):
+        return None
+    st = video.stat()
+    neg_key = f"noembed:{video}:{st.st_size}:{int(st.st_mtime)}"
+    if cache.get(neg_key):
+        return None  # already probed, nothing usable: don't re-read a multi-GB file every scan
+    if CFG["keep_extracted"]:
+        dest = Path(f"{base}.en.srt")
+    else:
+        h = hashlib.sha1(str(video).encode()).hexdigest()[:16]
+        dest = Path(CFG["cache"]).parent / "extracted" / f"{h}.en.srt"
+    if dest.exists() and dest.stat().st_mtime >= st.st_mtime:
+        return dest
+    from .embedded import extract_english_srt
+    if extract_english_srt(video, dest):
+        return dest
+    cache.put(neg_key, True)
+    log.info("no usable English subtitle in %s", video.name)
+    return None
+
+
+def process(base: Path, src: Path, cache, force=False):
     did = False
     for lang in CFG["targets"]:
         dst = Path(f"{base}.{lang}.srt")
         if dst.exists() and not force:
             log.debug("already present: %s", dst.name)
         else:
-            log.info("translating %s -> %s", src.name, lang)
+            log.info("translating %s -> %s", base.name, lang)
             t0 = time.time()
             cues = translate_file(src, lang, cache)
             write_atomic(dst, render_srt(cues))
@@ -274,17 +305,35 @@ def process(src, cache, force=False):
     return did
 
 
+def handle(path: Path, cache, force=False):
+    """path: a video file or an English .srt. Returns True if something was written."""
+    if path.suffix.lower() in CFG["video_exts"]:
+        base, video = path.with_suffix(""), path
+    else:
+        suf = next((s for s in CFG["source_suffixes"] if path.name.endswith(s)), None)
+        if not suf:
+            log.info("skipped (not a video nor a %s source): %s", CFG["source_suffixes"], path.name)
+            return False
+        base, video = path.with_name(path.name[: -len(suf)]), None
+    if not pending_outputs(base, force):
+        return False
+    src = find_source(base, video, cache)
+    if src is None:
+        return False
+    return process(base, src, cache, force)
+
+
 def scan(cache, force=False):
     now = time.time()
     n_ok = n_err = 0
     for lib in CFG["libs"]:
-        for p in sorted(Path(lib).rglob("*.srt")):
-            if not any(p.name.endswith(s) for s in CFG["source_suffixes"]):
+        for p in sorted(Path(lib).rglob("*")):
+            if p.suffix.lower() not in CFG["video_exts"] or not p.is_file():
                 continue
             if now - p.stat().st_mtime < CFG["settle"]:
-                continue
+                continue  # still being copied/remuxed
             try:
-                if process(p, cache, force):
+                if handle(p, cache, force):
                     n_ok += 1
             except Exception as e:  # one failing file must not block the rest
                 n_err += 1
@@ -297,24 +346,20 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="subtrans")
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    f = sub.add_parser("file")
+    f = sub.add_parser("file", help="process one video file or one English .srt")
     f.add_argument("path")
     f.add_argument("--force", action="store_true")
-    s = sub.add_parser("scan")
+    s = sub.add_parser("scan", help="walk LIBRARY_PATHS for video files")
     s.add_argument("--watch", type=int, default=0, help="rescan every N seconds")
     s.add_argument("--force", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
-    if CFG["backend"] != "dummy" and CFG["backend"] != "openai" and not CFG["api_key"]:
+    if CFG["backend"] not in ("dummy", "openai") and not CFG["api_key"]:
         sys.exit("API_KEY is missing")
     cache = Cache(CFG["cache"])
     if a.cmd == "file":
-        p = Path(a.path)
-        if not any(p.name.endswith(s) for s in CFG["source_suffixes"]):
-            log.info("skipped (not a %s source): %s", CFG["source_suffixes"], p.name)
-            return 0
-        process(p, cache, a.force)
+        handle(Path(a.path), cache, a.force)
         return 0
     while True:
         errs = scan(cache, a.force)

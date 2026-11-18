@@ -1,6 +1,6 @@
 # jimaku-llm (字幕)
 
-Automatically translates the `*.en.srt` subtitles of a Jellyfin/Plex media library into other languages
+Automatically translates the English subtitles of a Jellyfin/Plex media library into other languages
 (`*.fr.srt`, `*.ja.srt`, …) with an LLM, and generates a Japanese `*.ja.ass` with **furigana** above every kanji
 — handy for watching anime/films while learning Japanese.
 
@@ -11,7 +11,10 @@ Works with Gemini, Claude, or any OpenAI-compatible API (OpenAI, Ollama, vLLM, L
 ## How it works
 
 ```
-library scan ──► *.en.srt without *.<lang>.srt
+library scan ──► video without *.<lang>.srt
+                    │
+                    ▼
+         English source: external *.en.srt, else embedded track (ffmpeg)
                     │
                     ▼
          batches of ~60 cues + rolling context (previous lines)
@@ -27,6 +30,16 @@ library scan ──► *.en.srt without *.<lang>.srt
 - **Furigana** are *not* LLM-generated: readings come from MeCab + UniDic (deterministic, free, fast),
   with a small override table for context-dependent words (何 なに/なん, 一日, …). Each reading is placed
   with `\pos` above its kanji, okurigana excluded.
+
+## Subtitle sources
+
+1. An external `<video>.en.srt` / `<video>.eng.srt` (e.g. downloaded by Bazarr).
+2. Otherwise, the **embedded** English track of the video, extracted with `ffprobe`/`ffmpeg`:
+   text codecs only (SubRip, ASS/SSA, mov_text, WebVTT); forced and "Signs & Songs" tracks are skipped;
+   SubRip is preferred over ASS, plain over SDH.
+   Image-based tracks (PGS, VobSub) would need OCR and are skipped.
+   The extracted copy is kept in the cache dir (set `KEEP_EXTRACTED=1` to write `<video>.en.srt` instead).
+   Videos with no usable track are remembered (keyed by path/size/mtime), so multi-GB files are not re-read every scan.
 
 ## Reliability
 
@@ -46,7 +59,7 @@ cp .env.example .env && $EDITOR .env      # API_KEY=...
 $EDITOR docker-compose.yml                 # set your media volume
 docker compose pull
 # try a single file first
-docker compose run --rm subtrans file "/media/Movies/X (1993)/X.en.srt" -v
+docker compose run --rm subtrans file "/media/Movies/X (1993)/X.mkv" -v
 # then run as a service (rescans every 15 min)
 docker compose up -d
 ```
@@ -78,7 +91,10 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `MODELS` | `gemini-2.5-flash` | comma-separated, tried in order |
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
-| `SOURCE_SUFFIXES` | `.en.srt,.eng.srt` | |
+| `SOURCE_SUFFIXES` | `.en.srt,.eng.srt` | external sources |
+| `EXTRACT_EMBEDDED` | `1` | fall back to the embedded English track |
+| `KEEP_EXTRACTED` | `0` | `1` = write the extracted `<video>.en.srt` next to the video |
+| `VIDEO_EXTS` | `.mkv,.mp4,.m4v,.avi` | |
 | `FURIGANA` | `1` | generate `.ja.ass` |
 | `BATCH_SIZE` / `CONTEXT_CUES` | `60` / `8` | |
 | `MAX_RETRIES` / `MIN_INTERVAL_S` | `6` / `1.0` | per model / seconds between requests |
@@ -99,6 +115,7 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 ## Development
 
 ```bash
+# needs ffmpeg on PATH for the embedded-subtitle test
 pip install requests "fugashi[unidic-lite]" pytest && pytest -q
 ```
 
