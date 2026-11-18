@@ -11,7 +11,7 @@ Works with Gemini, Claude, or any OpenAI-compatible API (OpenAI, Ollama, vLLM, L
 ## How it works
 
 ```
-library scan ──► video without *.<lang>.srt
+library scan ──► video with Japanese audio, missing <lang> subtitles
                     │
                     ▼
          English source: external *.en.srt, else embedded track (ffmpeg)
@@ -31,15 +31,24 @@ library scan ──► video without *.<lang>.srt
   with a small override table for context-dependent words (何 なに/なん, 一日, …). Each reading is placed
   with `\pos` above its kanji, okurigana excluded.
 
-## Subtitle sources
+## What gets translated
 
-1. An external `<video>.en.srt` / `<video>.eng.srt` (e.g. downloaded by Bazarr).
-2. Otherwise, the **embedded** English track of the video, extracted with `ffprobe`/`ffmpeg`:
-   text codecs only (SubRip, ASS/SSA, mov_text, WebVTT); forced and "Signs & Songs" tracks are skipped;
-   SubRip is preferred over ASS, plain over SDH.
-   Image-based tracks (PGS, VobSub) would need OCR and are skipped.
-   The extracted copy is kept in the cache dir (set `KEEP_EXTRACTED=1` to write `<video>.en.srt` instead).
-   Videos with no usable track are remembered (keyed by path/size/mtime), so multi-GB files are not re-read every scan.
+For every video under `LIBRARY_PATHS`:
+
+1. **Audio filter** — skipped unless it has an audio track in `REQUIRE_AUDIO_LANGS` (default `ja`:
+   Japanese films, anime, tokusatsu…). Untagged (`und`) audio does not match: fix the tag with
+   `mkvpropedit X.mkv --edit track:a1 --set language=jpn`, or set `REQUIRE_AUDIO_LANGS=` to disable the filter.
+2. **Existing subtitles win** — a target language is skipped when subtitles already exist, either
+   - next to the video, with Bazarr/Radarr naming: `X.fr.srt`, `X.fre.srt`, `X.fra.hi.srt`, `X.ja.ass`… (`*.forced.*` does not count), or
+   - embedded in the container as a full text track (not forced, not "Signs & Songs").
+3. **English source** — an external `X.en.srt` / `X.eng.srt`, otherwise the **embedded** English text track,
+   extracted with `ffprobe`/`ffmpeg` (SubRip preferred over ASS, plain over SDH). Image-based tracks
+   (PGS, VobSub) would need OCR and are skipped. The extracted copy stays in the cache dir
+   (`KEEP_EXTRACTED=1` writes `X.en.srt` next to the video instead).
+4. **Furigana** — `X.ja.ass` is built from **real Japanese subtitles** when the video has some (embedded or external),
+   and only falls back to our own Japanese translation otherwise.
+
+`ffprobe` results are cached by path/size/mtime, so periodic rescans of a large library do not re-read the files.
 
 ## Reliability
 
@@ -91,7 +100,7 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `MODELS` | `gemini-3.8-flash` | comma-separated, tried in order |
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
-| `SOURCE_SUFFIXES` | `.en.srt,.eng.srt` | external sources |
+| `REQUIRE_AUDIO_LANGS` | `ja` | only process videos with one of these audio languages; empty = all |
 | `EXTRACT_EMBEDDED` | `1` | fall back to the embedded English track |
 | `KEEP_EXTRACTED` | `0` | `1` = write the extracted `<video>.en.srt` next to the video |
 | `VIDEO_EXTS` | `.mkv,.mp4,.m4v,.avi` | |
