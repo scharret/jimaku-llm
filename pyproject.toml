@@ -1,0 +1,10 @@
+[project]
+name = "jimaku-llm"
+version = "0.1.0"
+description = "LLM subtitle translation (fr/ja) with furigana ASS for Jellyfin/Plex libraries"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.32", "fugashi[unidic-lite]>=1.4"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
