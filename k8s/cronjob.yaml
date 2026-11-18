@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: subtrans
+  namespace: media
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid          # jamais deux scans en parallèle sur le même cache
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 10800
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext: { runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
+          containers:
+            - name: subtrans
+              image: ghcr.io/scharret/jimaku-llm:latest
+              args: ["scan"]
+              envFrom:
+                - secretRef: { name: subtrans-api }   # kubectl create secret generic subtrans-api --from-literal=API_KEY=...
+              env:
+                - { name: BACKEND, value: gemini }
+                - { name: MODELS, value: "gemini-2.5-flash,gemini-2.5-flash-lite" }
+                - { name: TARGET_LANGS, value: "fr,ja" }
+                - { name: LIBRARY_PATHS, value: "/media/Movies:/media/Shows" }
+                - { name: MIN_INTERVAL_S, value: "4" }
+                - { name: CACHE_DB, value: /cache/subtrans.db }
+              resources:
+                requests: { cpu: 50m, memory: 256Mi }
+                limits: { memory: 768Mi }
+              volumeMounts:
+                - { name: media, mountPath: /media }
+                - { name: cache, mountPath: /cache }
+          volumes:
+            - name: media
+              nfs: { server: truenas.lan, path: /mnt/tank/media }
+            - name: cache
+              persistentVolumeClaim: { claimName: subtrans-cache }
