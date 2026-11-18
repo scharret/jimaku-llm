@@ -119,6 +119,13 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 pip install requests "fugashi[unidic-lite]" pytest && pytest -q
 ```
 
+## Contributing
+
+- Work on a branch and open a PR to `main`; `main` is protected.
+- Commits and PR titles follow [Conventional Commits](https://www.conventionalcommits.org/)
+  (`feat:`, `fix:`, `docs:`, `chore:`, `ci:`, `refactor:`, `test:`, `perf:`, `build:`), enforced in CI.
+- PRs are squash-merged: the PR title becomes the commit message on `main`.
+
 ## Disclaimer
 
 Machine translation: good enough to follow a film, not a substitute for official subtitles.
