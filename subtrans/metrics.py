@@ -17,6 +17,7 @@ HELP = {
     "jimaku_llm_tokens_total": ("counter", "Tokens reported by the provider, by model and kind (input/output)"),
     "jimaku_cache_hits_total": ("counter", "Translated batches served from the cache"),
     "jimaku_cues_translated_total": ("counter", "Subtitle cues translated, by target language"),
+    "jimaku_ocr_cues_total": ("counter", "Subtitle cues recognised by OCR, by language and engine"),
     "jimaku_files_written_total": ("counter", "Subtitle files written, by kind (srt language / ass)"),
     "jimaku_scan_last_success_timestamp_seconds": ("gauge", "End of the last completed scan"),
     "jimaku_scan_duration_seconds": ("gauge", "Duration of the last scan"),

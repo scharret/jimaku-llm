@@ -70,7 +70,10 @@ CFG = dict(
     source_langs=[x.strip() for x in env("SOURCE_LANGS", "en,fr").split(",") if x.strip()],
     # Safety net against runaway sources (effect-heavy ASS, broken files): a film has ~1-3k cues.
     max_cues=env("MAX_CUES", 5000, int),
-    metrics_port=env("METRICS_PORT", 9108, int),   # 0 = disabled; only served in scan --watch mode
+    metrics_port=env("METRICS_PORT", 9108, int),
+    # OCR of image-based PGS (Blu-ray) subtitles: Tesseract locally, a vision LLM for OCR_VISION_LANGS.
+    ocr=env("OCR", "1") == "1",
+    ocr_vision_langs=[x.strip() for x in env("OCR_VISION_LANGS", "ja").split(",") if x.strip()],   # 0 = disabled; only served in scan --watch mode
     video_exts=[e.strip().lower() for e in env("VIDEO_EXTS", ".mkv,.mp4,.m4v,.avi").split(",")],
 )
 
@@ -239,6 +242,99 @@ def call_llm(model, system, user):
         items = json.loads(user.split("TRANSLATE:\n", 1)[1])
         return json.dumps({k: f"[{model}] {v}" for k, v in items.items()}, ensure_ascii=False)
     raise ValueError(f"unknown BACKEND: {b}")
+
+
+def call_vision(model, prompt, items):
+    """items: [(id, png_bytes)]. Returns the raw model text (JSON expected)."""
+    from .ocr import b64
+    b = CFG["backend"]
+    if b == "gemini":
+        parts = [{"text": prompt}]
+        for k, png in items:
+            parts += [{"text": f"id {k}:"}, {"inline_data": {"mime_type": "image/png", "data": b64(png)}}]
+        data = _post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            {"x-goog-api-key": CFG["api_key"], "Content-Type": "application/json"},
+            {"contents": [{"role": "user", "parts": parts}],
+             "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"}})
+        u = data.get("usageMetadata") or {}
+        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"))
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError):
+            raise RetryableError(f"empty/blocked response: {str(data)[:200]}")
+    if b == "anthropic":
+        content = [{"type": "text", "text": prompt}]
+        for k, png in items:
+            content += [{"type": "text", "text": f"id {k}:"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64(png)}}]
+        data = _post("https://api.anthropic.com/v1/messages",
+                     {"x-api-key": CFG["api_key"], "anthropic-version": "2023-06-01"},
+                     {"model": model, "max_tokens": 8192, "temperature": 0.0,
+                      "messages": [{"role": "user", "content": content}]})
+        u = data.get("usage") or {}
+        _tokens(model, u.get("input_tokens"), u.get("output_tokens"))
+        return "".join(p.get("text", "") for p in data["content"])
+    if b == "openai":
+        content = [{"type": "text", "text": prompt}]
+        for k, png in items:
+            content += [{"type": "text", "text": f"id {k}:"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64(png)}"}}]
+        data = _post(f"{CFG['openai_base'].rstrip('/')}/chat/completions",
+                     {"Authorization": f"Bearer {CFG['api_key'] or 'none'}"},
+                     {"model": model, "temperature": 0.0, "response_format": {"type": "json_object"},
+                      "messages": [{"role": "user", "content": content}]})
+        u = data.get("usage") or {}
+        _tokens(model, u.get("prompt_tokens"), u.get("completion_tokens"))
+        return data["choices"][0]["message"]["content"]
+    if b == "dummy":
+        return json.dumps({k: f"[vision {model}] {k}" for k, _ in items})
+    raise ValueError(f"unknown BACKEND: {b}")
+
+
+def vision_batch(lang, items, cache):
+    """OCR a batch of subtitle images with a vision model; same retry/fallback rules as translation."""
+    from .ocr import images_key, vision_prompt
+    key = "ocr:" + images_key(items) + ":" + lang
+    hit = cache.get(key)
+    if hit:
+        metrics.inc("jimaku_cache_hits_total")
+        return hit
+    ids = {k for k, _ in items}
+    last_err = None
+    for model in CFG["models"]:
+        if model in _dead_models:
+            continue
+        for attempt in range(CFG["max_retries"]):
+            try:
+                try:
+                    out = parse_json_obj(call_vision(model, vision_prompt(lang), items))
+                except json.JSONDecodeError as e:
+                    raise BadOutput(f"invalid JSON: {e}") from e
+                if not isinstance(out, dict) or not set(out) <= ids:
+                    raise BadOutput("unexpected ids")
+                out = {k: str(out.get(k, "")).replace("\\n", "\n").strip() for k in ids}
+                cache.put(key, out)
+                metrics.inc("jimaku_llm_requests_total", model=model, outcome="ok")
+                return out
+            except ModelUnavailable as e:
+                _dead_models.add(model)
+                last_err = e
+                break
+            except RetryableError as e:
+                last_err = e
+                outcome = ("quota" if getattr(e, "quota", False) else "overloaded") \
+                    if isinstance(e, Overloaded) else "bad_output"
+                metrics.inc("jimaku_llm_requests_total", model=model, outcome=outcome)
+                delay = min(CFG["max_backoff"], (e.retry_after if isinstance(e, Overloaded) and e.retry_after
+                                                 else 15 * 2 ** attempt if getattr(e, "quota", False)
+                                                 else 2 ** attempt * 2)) + random.uniform(0, 1.5)
+                log.warning("%s OCR batch: %s (attempt %d/%d, waiting %.0fs)", model, e, attempt + 1,
+                            CFG["max_retries"], delay)
+                time.sleep(delay)
+    if isinstance(last_err, Overloaded):
+        raise ProviderBusy(f"all models overloaded or out of quota ({last_err})")
+    raise RuntimeError(f"OCR batch failed: {last_err}")
 
 
 def parse_json_obj(text):
@@ -459,8 +555,43 @@ def find_srt(lang, base: Path, video: Path | None, streams, ext, cache: Cache, e
     from .embedded import extract_srt
     if extract_srt(video, dest, lang, streams):
         return dest
+    if CFG["ocr"]:
+        ocr = ocr_source(lang, base, video, streams, cache)
+        if ocr:
+            return ocr
     cache.put(neg_key, True)
     return None
+
+
+def ocr_source(lang, base: Path, video: Path, streams, cache: Cache):
+    """OCR the best PGS track in `lang` into an SRT in the cache dir."""
+    from .embedded import aliases
+    from .ocr import ocr_track
+    codes = aliases(lang)
+    pgs = [s for s in streams if s.get("codec_type") == "subtitle" and s.get("codec_name") == "hdmv_pgs_subtitle"
+           and ((s.get("tags") or {}).get("language") or "").lower() in codes
+           and not (s.get("disposition") or {}).get("forced")
+           and "sign" not in ((s.get("tags") or {}).get("title") or "").lower()]
+    if not pgs:
+        return None
+    pgs.sort(key=lambda s: (bool((s.get("disposition") or {}).get("hearing_impaired")), s["index"]))
+    vision = lang in CFG["ocr_vision_langs"] and CFG["backend"] in ("gemini", "anthropic", "openai", "dummy")
+    engine = "vision" if vision else "tesseract"
+    dest = Path(str(extracted_path(video, base, lang))[:-4] + ".ocr.srt")
+    if dest.exists() and dest.stat().st_mtime >= video.stat().st_mtime:
+        return dest
+    log.info("OCR of embedded %s PGS stream #%s from %s (%s)", lang, pgs[0]["index"], video.name, engine)
+    srt = ocr_track(video, pgs[0]["index"], lang, engine,
+                    call_vision=lambda lg, items: vision_batch(lg, items, cache))
+    n = srt.count(" --> ")
+    metrics.inc("jimaku_ocr_cues_total", n, lang=lang, engine=engine)
+    if not n:
+        log.info("OCR found no text in %s", video.name)
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(dest, srt)
+    log.info("OCR %s: %d cues", lang, n)
+    return dest
 
 
 def resolve(path: Path):
@@ -481,7 +612,7 @@ def resolve(path: Path):
 
 def handle(path: Path, cache, force=False):
     """Decide what a video needs and do it. Returns True if something was written."""
-    from .embedded import audio_langs, full_text_sub_langs, normalize
+    from .embedded import audio_langs, available_sub_langs, normalize
     base, video = resolve(path)
     if base is None:
         log.info("skipped (not a video nor a subtitle file): %s", path.name)
@@ -504,7 +635,7 @@ def handle(path: Path, cache, force=False):
             return False
 
     ext = external_subs(base)
-    embedded = full_text_sub_langs(streams)
+    embedded = available_sub_langs(streams)  # text or image tracks: already watchable
     did = False
     written, problem = [], None
 
@@ -535,7 +666,7 @@ def handle(path: Path, cache, force=False):
                              and ((s.get("tags") or {}).get("language") or "").lower() in src_codes
                              for s in streams or [])
             log.info("no usable %s subtitle for %s", "/".join(CFG["source_langs"]), base.name)
-            problem = ("image_subs_only", "PGS/VobSub only, OCR needed") if image_only else \
+            problem = ("image_subs_only", "image-based subtitles only (VobSub, or OCR disabled/empty)") if image_only else \
                 ("no_source", f"no {'/'.join(CFG['source_langs'])} text subtitle")
         elif n_cues > CFG["max_cues"]:
             log.error("skipping %s: source %s has %d cues (> MAX_CUES=%d), probably effects/karaoke. "

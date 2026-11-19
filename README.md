@@ -43,12 +43,14 @@ For every video under `LIBRARY_PATHS`:
    - embedded in the container as a full text track (not forced, not "Signs & Songs").
 3. **Source subtitles** — the first language of `SOURCE_LANGS` (default `en,fr`) that is available:
    an external file (`X.en.srt`, `X.fre.srt`…), otherwise the **embedded** text track, extracted with
-   `ffprobe`/`ffmpeg` (SubRip preferred over ASS, plain over SDH). Image-based tracks (PGS, VobSub)
-   would need OCR and are skipped. Embedded **ASS** tracks are cleaned before translation: signs, songs/karaoke
+   `ffprobe`/`ffmpeg` (SubRip preferred over ASS, plain over SDH). **PGS** (Blu-ray image subtitles)
+   are OCR'd: Tesseract locally for most languages, a vision LLM for `OCR_VISION_LANGS` (default `ja`, where
+   Tesseract is weak). VobSub (DVD) is not supported yet. Embedded **ASS** tracks are cleaned before translation: signs, songs/karaoke
    and animated effect lines are dropped and layered duplicates merged (a fansub track can hold 100k+ effect
    events for ~1.5k dialogue lines). Files we generated ourselves are **never** used as a source
    (no translation of a translation); if Bazarr later replaces one with a real subtitle, it becomes eligible again.
    The extracted copy stays in the cache dir (`KEEP_EXTRACTED=1` writes `X.en.srt` next to the video instead).
+   A target language that already exists as an image track (PGS/VobSub) is not translated either: it is watchable as is.
 4. **Furigana** — `X.ja.ass` is built from **real Japanese subtitles** when the video has some (embedded or external),
    and only falls back to our own Japanese translation otherwise.
 
@@ -69,7 +71,7 @@ docker compose run --rm subtrans report --all --json           # machine-readabl
 |---|---|
 | `skipped/audio_language` | no audio track in `REQUIRE_AUDIO_LANGS` (or untagged) |
 | `skipped/no_source` | no text subtitle in `SOURCE_LANGS` |
-| `skipped/image_subs_only` | only PGS/VobSub source subtitles (OCR needed) |
+| `skipped/image_subs_only` | only image subtitles that could not be OCR'd (VobSub, `OCR=0`, nothing recognised) |
 | `skipped/too_many_cues` | source above `MAX_CUES` |
 | `skipped/probe_failed` | ffprobe could not read the file |
 | `failed/provider_busy` | all models overloaded / out of quota (resumes next scan) |
@@ -89,6 +91,7 @@ The Kubernetes CronJob runs one-shot scans and does not expose metrics.
 | `jimaku_cache_hits_total` | counter | |
 | `jimaku_cues_translated_total` | counter | `lang` |
 | `jimaku_files_written_total` | counter | `kind` (e.g. `fr.srt`, `ja.ass`) |
+| `jimaku_ocr_cues_total` | counter | `lang`, `engine` = tesseract / vision |
 | `jimaku_videos` | gauge | `state`, `reason` (same as `subtrans report`, persisted) |
 | `jimaku_scan_duration_seconds`, `jimaku_scan_last_success_timestamp_seconds` | gauge | |
 
@@ -150,6 +153,8 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `MODELS` | `gemini-3.8-flash` | comma-separated, tried in order |
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
+| `OCR` | `1` | OCR image-based PGS tracks |
+| `OCR_VISION_LANGS` | `ja` | languages OCR'd with the vision LLM (others: Tesseract) |
 | `METRICS_PORT` | `9108` | `/metrics` in `scan --watch` mode; `0` disables |
 | `MAX_CUES` | `5000` | safety net: sources with more cues are skipped (runaway effects, broken files) |
 | `SOURCE_LANGS` | `en,fr` | source subtitle languages, in order of preference |

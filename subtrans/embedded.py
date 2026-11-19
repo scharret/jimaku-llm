@@ -76,6 +76,15 @@ def full_text_sub_langs(streams):
             and not any(w in (_tags(s).get("title") or "").lower() for w in SKIP_TITLE_WORDS)}
 
 
+def available_sub_langs(streams):
+    """Languages with a complete subtitle track, text or image (PGS/VobSub): no need to translate them."""
+    return full_text_sub_langs(streams) | {
+        stream_lang(s) for s in streams
+        if s.get("codec_type") == "subtitle" and s.get("codec_name") in IMAGE_CODECS
+        and not _disp(s).get("forced")
+        and not any(w in (_tags(s).get("title") or "").lower() for w in SKIP_TITLE_WORDS)}
+
+
 def pick_text_track(streams, lang):
     """Best full text track in `lang`: not forced, not signs/songs, SubRip first, plain before SDH."""
     codes = aliases(lang)

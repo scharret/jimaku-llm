@@ -420,3 +420,64 @@ def test_metrics_exposition(tmp_path, monkeypatch):
     assert 'jimaku_files_written_total{kind="ja.ass"} 2' in body
     assert 'jimaku_cache_hits_total' in body
     assert 'jimaku_videos{reason="translated",state="done"} 1' in body
+
+
+# ---------------------------------------------------------------- OCR (PGS)
+from tests.pgs_encode import encode as encode_pgs  # noqa: E402
+
+LATIN_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+needs_tesseract = pytest.mark.skipif(not shutil.which("tesseract") or not os.path.exists(LATIN_FONT),
+                                     reason="tesseract or test font missing")
+PGS_SUBS = [(1.0, 2.5, "Where is Conan?"), (3.0, 4.5, "I don't know.")]
+
+
+@needs_tesseract
+def test_pgs_parse_and_tesseract():
+    from subtrans.ocr import ocr_tesseract, parse_sup, render
+    sets = list(parse_sup(encode_pgs(PGS_SUBS, LATIN_FONT)))
+    assert [(round(a, 2), round(b, 2)) for a, b, _ in sets] == [(1.0, 2.5), (3.0, 4.5)]
+    texts = ocr_tesseract([render(objs) for _, _, objs in sets], "en")
+    assert "Conan" in texts[0] and "know" in texts[1]
+
+
+def mux_pgs(tmp_path, video, audio_lang, tracks):
+    """tracks: [(sup_bytes, lang)]"""
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=1920x1080:d=6",
+           "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono"]
+    for i, (sup, _) in enumerate(tracks):
+        f = tmp_path / f"t{i}.sup"
+        f.write_bytes(sup)
+        cmd += ["-i", str(f)]
+    cmd += ["-map", "0:v", "-map", "1:a"] + sum((["-map", f"{i + 2}"] for i in range(len(tracks))), [])
+    cmd += ["-t", "6", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-c:s", "copy",
+            "-metadata:s:a:0", f"language={audio_lang}"]
+    for i, (_, lang) in enumerate(tracks):
+        cmd += [f"-metadata:s:s:{i}", f"language={lang}"]
+    subprocess.run(cmd + [str(video)], check=True)
+    return video
+
+
+@needs_ffmpeg
+@needs_tesseract
+def test_pgs_english_is_ocrd_then_translated(tmp_path):
+    d = film_dir(tmp_path)
+    video = mux_pgs(tmp_path, d / "Film.mkv", "jpn", [(encode_pgs(PGS_SUBS, LATIN_FONT), "eng")])
+    c = cache()
+    assert m.handle(video, c) is True
+    fr = m.parse_srt(d / "Film.fr.srt")
+    assert len(fr) == 2 and "Conan" in fr[0][2] and fr[0][2].startswith("[a] ")
+    assert (d / "Film.ja.ass").exists()
+    assert c.statuses(state="done")[0][2] == "translated"
+
+
+@needs_ffmpeg
+@needs_tesseract
+def test_pgs_japanese_uses_vision_and_is_not_translated(tmp_path):
+    d = film_dir(tmp_path)
+    video = mux_pgs(tmp_path, d / "Film.mkv", "jpn", [(encode_pgs(PGS_SUBS, LATIN_FONT), "eng"),
+                                                     (encode_pgs(PGS_SUBS, LATIN_FONT), "jpn")])
+    assert m.handle(video, cache()) is True
+    assert not (d / "Film.ja.srt").exists()            # Japanese PGS exists: not translated
+    ass = (d / "Film.ja.ass").read_text(encoding="utf-8-sig")
+    assert "[vision a] 1" in ass                       # furigana built from the OCR'd Japanese (vision engine)
+    assert (d / "Film.fr.srt").exists()                # French still translated (from OCR'd English)
