@@ -226,3 +226,48 @@ def test_embedded_target_languages_are_reused(tmp_path):
     ass = (d / "Film.ja.ass").read_text(encoding="utf-8-sig")
     assert "家に帰った" in ass and "かえ" in ass  # ...but furigana built from the real Japanese track
     assert m.handle(video, cache()) is False
+
+
+def test_overload_stops_without_bisecting(tmp_path, monkeypatch):
+    calls = []
+
+    def busy(model, s, u):
+        calls.append(model)
+        raise m.Overloaded("HTTP 429", quota=True)
+
+    monkeypatch.setattr(m, "call_llm", busy)
+    src = film_dir(tmp_path) / "Film.en.srt"
+    src.write_text(SRT * 1, encoding="utf-8")
+    cues = m.parse_srt(src) * 5  # 20 cues: would be bisected if this were a format error
+    cues = [(i + 1, tc, t) for i, (_, tc, t) in enumerate(cues)]
+    with pytest.raises(m.ProviderBusy):
+        m.translate_batch(cues, [], "fr", "", cache())
+    assert len(calls) == 2 * m.CFG["max_retries"]  # models x retries, no extra requests from bisection
+
+
+def test_bad_output_is_bisected(tmp_path, monkeypatch):
+    real = m.call_llm
+
+    def picky(model, s, u):
+        import json as _j
+        items = _j.loads(u.split("TRANSLATE:\n", 1)[1])
+        if len(items) > 10:
+            return "not json"
+        return real(model, s, u)
+
+    monkeypatch.setattr(m, "call_llm", picky)
+    src = film_dir(tmp_path) / "Film.en.srt"
+    src.write_text(SRT, encoding="utf-8")
+    cues = [(i + 1, tc, t) for i, (_, tc, t) in enumerate(m.parse_srt(src) * 5)]
+    out = m.translate_batch(cues, [], "fr", "", cache())
+    assert len(out) == 20 and all(v.startswith("[") for v in out.values())
+
+
+def test_file_mode_exits_75_when_provider_busy(tmp_path, monkeypatch):
+    def busy(model, s, u):
+        raise m.Overloaded("HTTP 503")
+
+    monkeypatch.setattr(m, "call_llm", busy)
+    src = film_dir(tmp_path) / "Film.en.srt"
+    src.write_text(SRT, encoding="utf-8")
+    assert m.main(["file", str(src)]) == 75

@@ -52,6 +52,7 @@ CFG = dict(
     batch=env("BATCH_SIZE", 60, int),
     context=env("CONTEXT_CUES", 8, int),
     max_retries=env("MAX_RETRIES", 6, int),
+    max_backoff=env("MAX_BACKOFF_S", 300, int),
     min_interval=env("MIN_INTERVAL_S", 1.0, float),   # simple rate limit between requests
     cache=env("CACHE_DB", "/cache/subtrans.db"),
     libs=[p for p in env("LIBRARY_PATHS", "/media").split(":") if p],
@@ -111,6 +112,23 @@ class RetryableError(Exception):
     pass
 
 
+class Overloaded(RetryableError):
+    """Capacity/quota problem on the provider side (429, 5xx, timeouts): retrying smaller won't help."""
+
+    def __init__(self, msg, retry_after=None, quota=False):
+        super().__init__(msg)
+        self.retry_after = retry_after
+        self.quota = quota
+
+
+class BadOutput(RetryableError):
+    """The model answered but the JSON is broken or ids don't match: a smaller batch may help."""
+
+
+class ProviderBusy(Exception):
+    """Every model is overloaded or out of quota: stop now, resume from the cache later."""
+
+
 class ModelUnavailable(Exception):
     """The model does not exist or is not offered to this account (HTTP 404): skip it for good."""
 
@@ -133,10 +151,16 @@ def _post(url, headers, body):
     try:
         r = requests.post(url, headers=headers, json=body, timeout=CFG["timeout"])
     except requests.RequestException as e:
-        raise RetryableError(f"network: {type(e).__name__}") from e
+        raise Overloaded(f"network: {type(e).__name__}") from e
     if r.status_code in RETRYABLE:
         ra = r.headers.get("Retry-After")
-        raise RetryableError(f"HTTP {r.status_code}" + (f" retry-after={ra}" if ra else ""))
+        try:
+            reason = (r.json().get("error") or {}).get("message", "")[:160]
+        except ValueError:
+            reason = ""
+        raise Overloaded(f"HTTP {r.status_code}" + (f" ({reason})" if reason else ""),
+                         retry_after=float(ra) if ra and ra.replace(".", "", 1).isdigit() else None,
+                         quota=r.status_code == 429)
     if r.status_code == 404:
         raise ModelUnavailable(f"HTTP 404: {r.text[:300]}")
     if r.status_code >= 400:
@@ -221,9 +245,12 @@ def translate_batch(batch, ctx, lang, glossary, cache):
             continue
         for attempt in range(CFG["max_retries"]):
             try:
-                out = parse_json_obj(call_llm(model, sys_p, user))
-                if set(out) != set(src):
-                    raise RetryableError(f"id mismatch ({len(out)}/{len(src)})")
+                try:
+                    out = parse_json_obj(call_llm(model, sys_p, user))
+                except json.JSONDecodeError as e:
+                    raise BadOutput(f"invalid JSON: {e}") from e
+                if not isinstance(out, dict) or set(out) != set(src):
+                    raise BadOutput(f"id mismatch ({len(out) if isinstance(out, dict) else '?'}/{len(src)})")
                 out = {k: str(v).replace("\\n", "\n").strip() or src[k] for k, v in out.items()}
                 cache.put(key, out)
                 return out
@@ -232,17 +259,26 @@ def translate_batch(batch, ctx, lang, glossary, cache):
                 last_err = e
                 log.error("model %s unavailable, disabling it for this run: %s", model, e)
                 break
-            except (RetryableError, json.JSONDecodeError) as e:
+            except RetryableError as e:
                 last_err = e
-                delay = min(120, 2 ** attempt * 2) + random.uniform(0, 1.5)
-                log.warning("%s batch %s-%s: %s (attempt %d, waiting %.0fs)", model, batch[0][0],
-                            batch[-1][0], e, attempt + 1, delay)
+                if isinstance(e, Overloaded) and e.retry_after:
+                    delay = min(CFG["max_backoff"], e.retry_after)
+                elif isinstance(e, Overloaded) and e.quota:
+                    delay = min(CFG["max_backoff"], 15 * 2 ** attempt)  # quota windows are ~1 min
+                else:
+                    delay = min(CFG["max_backoff"], 2 ** attempt * 2)
+                delay += random.uniform(0, 1.5)
+                log.warning("%s batch %s-%s: %s (attempt %d/%d, waiting %.0fs)", model, batch[0][0],
+                            batch[-1][0], e, attempt + 1, CFG["max_retries"], delay)
                 time.sleep(delay)
         if model not in _dead_models:
-            log.warning("falling back to next model after failures on %s", model)
+            log.warning("giving up on %s for batch %s-%s", model, batch[0][0], batch[-1][0])
     if all(m in _dead_models for m in CFG["models"]):
         raise RuntimeError(f"no usable model in MODELS={CFG['models']}: {last_err}")
-    # last resort: split the batch in half (large batches break the JSON more often)
+    if isinstance(last_err, Overloaded):
+        # Capacity/quota problem: splitting the batch would only multiply requests. Stop and resume later.
+        raise ProviderBusy(f"all models overloaded or out of quota ({last_err})")
+    # Broken output: split the batch in half (large batches break the JSON more often)
     if len(batch) > 8:
         mid = len(batch) // 2
         a = translate_batch(batch[:mid], ctx, lang, glossary, cache)
@@ -447,6 +483,9 @@ def scan(cache, force=False):
             try:
                 if handle(p, cache, force):
                     n_ok += 1
+            except ProviderBusy as e:  # hitting the next files would fail the same way
+                log.error("stopping scan: %s; progress is cached, next scan resumes", e)
+                return n_err + 1
             except Exception as e:  # one failing file must not block the rest
                 n_err += 1
                 log.error("failed %s: %s", p, e)
@@ -471,7 +510,11 @@ def main(argv=None):
         sys.exit("API_KEY is missing")
     cache = Cache(CFG["cache"])
     if a.cmd == "file":
-        handle(Path(a.path), cache, a.force)
+        try:
+            handle(Path(a.path), cache, a.force)
+        except ProviderBusy as e:
+            log.error("%s. Progress is cached: rerun the same command later to resume.", e)
+            return 75  # EX_TEMPFAIL
         return 0
     while True:
         errs = scan(cache, a.force)
