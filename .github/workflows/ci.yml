@@ -19,7 +19,10 @@ jobs:
           cache-dependency-path: pyproject.toml
       # Static ffmpeg binary (cached) instead of apt: the runners' APT mirrors are sometimes very slow.
       - uses: FedericoCarboni/setup-ffmpeg@v3
-      - run: pip install requests "fugashi[unidic-lite]" pytest
+      - name: Install Tesseract (OCR tests)
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng fonts-dejavu-core
+        timeout-minutes: 5
+      - run: pip install requests "fugashi[unidic-lite]" pillow pytest
       - run: pytest -q
   image:
     needs: test
