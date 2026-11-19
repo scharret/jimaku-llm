@@ -370,3 +370,29 @@ def test_embedded_ass_is_cleaned(tmp_path):
     assert m.handle(video, cache()) is True
     fr = m.parse_srt(d / "Film.fr.srt")
     assert [c[2] for c in fr] == ["[a] Where is Conan?", "[a] I don't know.\nLet's go."]
+
+
+def test_report_tracks_skips(tmp_path, monkeypatch, capsys):
+    monkeypatch.setitem(m.CFG, "max_cues", 3)
+    d = film_dir(tmp_path)
+    (d / "Film.en.srt").write_text(SRT, encoding="utf-8")
+    c = cache()
+    m.handle(d / "Film.en.srt", c)
+    rows = c.statuses(reason="too_many_cues")
+    assert len(rows) == 1 and "4 cues > MAX_CUES=3" in rows[0][3]
+    assert m.main(["report"]) == 0
+    out = capsys.readouterr().out
+    assert "skipped/too_many_cues=1" in out and "Film" in out
+    monkeypatch.setitem(m.CFG, "max_cues", 5000)
+    m.handle(d / "Film.en.srt", c)                 # fixed: now translated, status updated
+    assert c.statuses(state="skipped") == []
+    assert c.statuses(state="done")[0][2] == "translated"
+
+
+@needs_ffmpeg
+def test_report_audio_language(tmp_path):
+    d = film_dir(tmp_path)
+    video = make_video(d / "Film.mkv", "eng", [(SRT, "eng")])
+    c = cache()
+    m.handle(video, c)
+    assert c.statuses(reason="audio_language")[0][3] == "audio: en"

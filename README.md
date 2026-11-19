@@ -54,6 +54,28 @@ For every video under `LIBRARY_PATHS`:
 
 `ffprobe` results are cached by path/size/mtime, so periodic rescans of a large library do not re-read the files.
 
+## What was skipped, and why
+
+Every video's last outcome is stored in the cache DB, and each scan ends with a one-line summary
+(`not translated: skipped/no_source=23, skipped/too_many_cues=1 …`). Details:
+
+```bash
+docker compose run --rm subtrans report                        # everything not done (audio filter hidden)
+docker compose run --rm subtrans report --reason too_many_cues
+docker compose run --rm subtrans report --all --json           # machine-readable
+```
+
+| state / reason | meaning |
+|---|---|
+| `skipped/audio_language` | no audio track in `REQUIRE_AUDIO_LANGS` (or untagged) |
+| `skipped/no_source` | no text subtitle in `SOURCE_LANGS` |
+| `skipped/image_subs_only` | only PGS/VobSub source subtitles (OCR needed) |
+| `skipped/too_many_cues` | source above `MAX_CUES` |
+| `skipped/probe_failed` | ffprobe could not read the file |
+| `failed/provider_busy` | all models overloaded / out of quota (resumes next scan) |
+| `failed/error` | unexpected error, message in `detail` |
+| `done/translated`, `done/already_available` | OK |
+
 ## Reliability
 
 - **Idempotent**: an existing output is never overwritten (`--force` to redo). A human-made subtitle
