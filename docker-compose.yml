@@ -19,4 +19,6 @@ services:
     volumes:
       - /mnt/tank/media:/media   # adjust to your media dataset path
       - ./cache:/cache
+    ports:
+      - "9108:9108"              # Prometheus /metrics
     command: ["scan", "--watch", "900"]

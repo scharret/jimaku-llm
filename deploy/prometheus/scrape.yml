@@ -1,0 +1,5 @@
+# Add to prometheus.yml (scrape_configs:)
+- job_name: jimaku-llm
+  scrape_interval: 60s
+  static_configs:
+    - targets: ["truenas.lan:9108"]
