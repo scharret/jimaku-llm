@@ -66,6 +66,8 @@ CFG = dict(
     require_audio=[x.strip() for x in env("REQUIRE_AUDIO_LANGS", "ja").split(",") if x.strip()],
     # Source subtitle languages to translate from, in order of preference.
     source_langs=[x.strip() for x in env("SOURCE_LANGS", "en,fr").split(",") if x.strip()],
+    # Safety net against runaway sources (effect-heavy ASS, broken files): a film has ~1-3k cues.
+    max_cues=env("MAX_CUES", 5000, int),
     video_exts=[e.strip().lower() for e in env("VIDEO_EXTS", ".mkv,.mp4,.m4v,.avi").split(",")],
 )
 
@@ -371,7 +373,8 @@ def extracted_path(video: Path, base: Path, lang):
     if CFG["keep_extracted"] and lang == "en":
         return Path(f"{base}.en.srt")
     h = hashlib.sha1(str(video).encode()).hexdigest()[:16]
-    return Path(CFG["cache"]).parent / "extracted" / f"{h}.{lang}.srt"
+    # "v2": extraction with ASS cleanup; older (uncleaned) extractions are ignored.
+    return Path(CFG["cache"]).parent / "extracted" / f"{h}.v2.{lang}.srt"
 
 
 def _sig(f: Path):
@@ -473,8 +476,12 @@ def handle(path: Path, cache, force=False):
             if src:
                 src_lang = cand
                 break
+        n_cues = len(parse_srt(src)) if src is not None else 0
         if src is None:
             log.info("no usable %s subtitle for %s", "/".join(CFG["source_langs"]), base.name)
+        elif n_cues > CFG["max_cues"]:
+            log.error("skipping %s: source %s has %d cues (> MAX_CUES=%d), probably effects/karaoke. "
+                      "Check the file or raise MAX_CUES.", base.name, src.name, n_cues, CFG["max_cues"])
         else:
             for lang in todo:
                 if lang == src_lang:

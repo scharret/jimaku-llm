@@ -44,7 +44,9 @@ For every video under `LIBRARY_PATHS`:
 3. **Source subtitles** — the first language of `SOURCE_LANGS` (default `en,fr`) that is available:
    an external file (`X.en.srt`, `X.fre.srt`…), otherwise the **embedded** text track, extracted with
    `ffprobe`/`ffmpeg` (SubRip preferred over ASS, plain over SDH). Image-based tracks (PGS, VobSub)
-   would need OCR and are skipped. Files we generated ourselves are **never** used as a source
+   would need OCR and are skipped. Embedded **ASS** tracks are cleaned before translation: signs, songs/karaoke
+   and animated effect lines are dropped and layered duplicates merged (a fansub track can hold 100k+ effect
+   events for ~1.5k dialogue lines). Files we generated ourselves are **never** used as a source
    (no translation of a translation); if Bazarr later replaces one with a real subtitle, it becomes eligible again.
    The extracted copy stays in the cache dir (`KEEP_EXTRACTED=1` writes `X.en.srt` next to the video instead).
 4. **Furigana** — `X.ja.ass` is built from **real Japanese subtitles** when the video has some (embedded or external),
@@ -107,6 +109,7 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `MODELS` | `gemini-3.8-flash` | comma-separated, tried in order |
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
+| `MAX_CUES` | `5000` | safety net: sources with more cues are skipped (runaway effects, broken files) |
 | `SOURCE_LANGS` | `en,fr` | source subtitle languages, in order of preference |
 | `REQUIRE_AUDIO_LANGS` | `ja` | only process videos with one of these audio languages; empty = all |
 | `EXTRACT_EMBEDDED` | `1` | fall back to the embedded English track |

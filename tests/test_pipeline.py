@@ -315,3 +315,58 @@ def test_embedded_french_only_gives_japanese(tmp_path):
     assert not (d / "Film.fr.srt").exists()           # French already embedded
     assert m.parse_srt(d / "Film.ja.srt")[0][2] == "[a] Bonjour."
     assert (d / "Film.ja.ass").exists()
+
+
+ASS = r"""[Script Info]
+ScriptType: v4.00+
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+Style: OP-Romaji,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+Style: Sign,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,Where is {\i1}Conan{\i0}?
+Dialogue: 1,0:00:01.00,0:00:02.50,Default,,0,0,0,,Where is {\i1}Conan{\i0}?
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,I don't know.\NLet's go.
+Dialogue: 0,0:00:01.00,0:00:01.04,OP-Romaji,,0,0,0,,{\k10}ka{\k12}ze
+Dialogue: 0,0:00:01.04,0:00:01.08,OP-Romaji,,0,0,0,,{\k10}ka{\k12}ze
+Dialogue: 0,0:00:02.00,0:00:02.04,Default,,0,0,0,,{\pos(320,40)\fad(0,200)}KUDO DETECTIVE AGENCY
+Dialogue: 0,0:00:02.00,0:00:02.04,Sign,,0,0,0,,Tokyo Tower
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,Karaoke,la la la
+Comment: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,note to self
+"""
+
+
+def test_ass_cleanup_keeps_dialogue_only():
+    from subtrans.ass_clean import ass_to_cues
+    cues, stats = ass_to_cues(ASS)
+    assert stats == {"events": 8, "cues": 2}
+    assert cues[0] == (1, "00:00:01,000 --> 00:00:02,500", "Where is Conan?")
+    assert cues[1][2] == "I don't know.\nLet's go."
+
+
+def test_max_cues_guard(tmp_path, monkeypatch):
+    monkeypatch.setitem(m.CFG, "max_cues", 3)
+    d = film_dir(tmp_path)
+    (d / "Film.en.srt").write_text(SRT, encoding="utf-8")  # 4 cues
+    assert m.handle(d / "Film.en.srt", cache()) is False
+    assert not (d / "Film.fr.srt").exists()
+
+
+@needs_ffmpeg
+def test_embedded_ass_is_cleaned(tmp_path):
+    d = film_dir(tmp_path)
+    ass = tmp_path / "in.ass"
+    ass.write_text(ASS, encoding="utf-8")
+    video = d / "Film.mkv"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=9",
+                    "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-i", str(ass),
+                    "-map", "0:v", "-map", "1:a", "-map", "2", "-t", "9", "-c:v", "libx264", "-c:a", "aac",
+                    "-c:s", "ass", "-metadata:s:a:0", "language=jpn", "-metadata:s:s:0", "language=eng",
+                    str(video)], check=True)
+    assert m.handle(video, cache()) is True
+    fr = m.parse_srt(d / "Film.fr.srt")
+    assert [c[2] for c in fr] == ["[a] Where is Conan?", "[a] I don't know.\nLet's go."]
