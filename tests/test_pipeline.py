@@ -271,3 +271,47 @@ def test_file_mode_exits_75_when_provider_busy(tmp_path, monkeypatch):
     src = film_dir(tmp_path) / "Film.en.srt"
     src.write_text(SRT, encoding="utf-8")
     assert m.main(["file", str(src)]) == 75
+
+
+def test_french_source_when_no_english(tmp_path):
+    d = film_dir(tmp_path)
+    src = d / "Film.fr.srt"
+    src.write_text(FR_SRT, encoding="utf-8")
+    assert m.handle(src, cache()) is True
+    assert not (d / "Film.en.srt").exists()
+    ja = m.parse_srt(d / "Film.ja.srt")
+    assert ja[0][2] == "[a] Bonjour."               # translated from the French file
+    assert (d / "Film.ja.ass").exists()
+
+
+def test_own_translation_is_never_a_source(tmp_path):
+    d = film_dir(tmp_path)
+    (d / "Film.en.srt").write_text(SRT, encoding="utf-8")
+    c = cache()
+    assert m.handle(d / "Film.en.srt", c) is True      # writes our Film.fr.srt / Film.ja.srt
+    assert m.is_ours(d / "Film.fr.srt", c)
+    for f in ("Film.en.srt", "Film.ja.srt", "Film.ja.ass"):
+        (d / f).unlink()
+    # Only our machine-translated French is left: it must not be re-translated into Japanese.
+    assert m.handle(d / "Film.fr.srt", c) is False
+    assert not (d / "Film.ja.srt").exists()
+
+
+def test_replaced_file_is_no_longer_ours(tmp_path):
+    d = film_dir(tmp_path)
+    f = d / "Film.fr.srt"
+    f.write_text(FR_SRT, encoding="utf-8")
+    c = cache()
+    m.mark_ours(f, c)
+    f.write_text(FR_SRT + "\n2\n00:00:03,000 --> 00:00:04,000\nSalut.\n", encoding="utf-8")  # e.g. Bazarr download
+    assert not m.is_ours(f, c)
+
+
+@needs_ffmpeg
+def test_embedded_french_only_gives_japanese(tmp_path):
+    d = film_dir(tmp_path)
+    video = make_video(d / "Film.mkv", "jpn", [(FR_SRT, "fre")])
+    assert m.handle(video, cache()) is True
+    assert not (d / "Film.fr.srt").exists()           # French already embedded
+    assert m.parse_srt(d / "Film.ja.srt")[0][2] == "[a] Bonjour."
+    assert (d / "Film.ja.ass").exists()
