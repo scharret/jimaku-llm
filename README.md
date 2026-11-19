@@ -76,6 +76,25 @@ docker compose run --rm subtrans report --all --json           # machine-readabl
 | `failed/error` | unexpected error, message in `detail` |
 | `done/translated`, `done/already_available` | OK |
 
+## Metrics (Prometheus)
+
+In `scan --watch` mode, `/metrics` is served on `METRICS_PORT` (default `9108`, `0` disables it).
+The Kubernetes CronJob runs one-shot scans and does not expose metrics.
+
+| metric | type | labels |
+|---|---|---|
+| `jimaku_llm_requests_total` | counter | `model`, `outcome` = ok / overloaded / quota / bad_output / unavailable |
+| `jimaku_llm_request_seconds_total` | counter | `model` |
+| `jimaku_llm_tokens_total` | counter | `model`, `kind` = input / output (as reported by the provider) |
+| `jimaku_cache_hits_total` | counter | |
+| `jimaku_cues_translated_total` | counter | `lang` |
+| `jimaku_files_written_total` | counter | `kind` (e.g. `fr.srt`, `ja.ass`) |
+| `jimaku_videos` | gauge | `state`, `reason` (same as `subtrans report`, persisted) |
+| `jimaku_scan_duration_seconds`, `jimaku_scan_last_success_timestamp_seconds` | gauge | |
+
+Counters reset on restart (use `increase()`/`rate()`). Scrape config and alert rules
+(stale scan, quota exhausted, high failure ratio, skipped files) are in [`deploy/prometheus/`](deploy/prometheus/).
+
 ## Reliability
 
 - **Idempotent**: an existing output is never overwritten (`--force` to redo). A human-made subtitle
@@ -131,6 +150,7 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `MODELS` | `gemini-3.8-flash` | comma-separated, tried in order |
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
+| `METRICS_PORT` | `9108` | `/metrics` in `scan --watch` mode; `0` disables |
 | `MAX_CUES` | `5000` | safety net: sources with more cues are skipped (runaway effects, broken files) |
 | `SOURCE_LANGS` | `en,fr` | source subtitle languages, in order of preference |
 | `REQUIRE_AUDIO_LANGS` | `ja` | only process videos with one of these audio languages; empty = all |

@@ -1,0 +1,29 @@
+groups:
+  - name: jimaku-llm
+    rules:
+      - alert: JimakuScanStale
+        expr: time() - jimaku_scan_last_success_timestamp_seconds > 2 * 3600
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "jimaku-llm has not completed a scan for 2h"
+          description: "Provider busy, crash loop or stuck translation. Check the container logs."
+      - alert: JimakuQuotaExhausted
+        expr: sum(increase(jimaku_llm_requests_total{outcome="quota"}[30m])) > 20
+        labels: { severity: warning }
+        annotations:
+          summary: "jimaku-llm is hitting the provider quota (429)"
+      - alert: JimakuHighFailureRatio
+        expr: |
+          sum(rate(jimaku_llm_requests_total{outcome!="ok"}[30m]))
+            / clamp_min(sum(rate(jimaku_llm_requests_total[30m])), 1e-9) > 0.5
+        for: 30m
+        labels: { severity: info }
+        annotations:
+          summary: "More than half of the LLM requests fail"
+      - alert: JimakuSkippedTooManyCues
+        expr: jimaku_videos{reason="too_many_cues"} > 0
+        labels: { severity: info }
+        annotations:
+          summary: "Some videos were skipped because their source has more than MAX_CUES cues"
+          description: "List them with: subtrans report --reason too_many_cues"

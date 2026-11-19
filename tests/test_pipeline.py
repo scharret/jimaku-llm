@@ -396,3 +396,27 @@ def test_report_audio_language(tmp_path):
     c = cache()
     m.handle(video, c)
     assert c.statuses(reason="audio_language")[0][3] == "audio: en"
+
+
+def test_metrics_exposition(tmp_path, monkeypatch):
+    import socket
+    import urllib.request
+    from subtrans import metrics
+    monkeypatch.setattr(metrics, "_counters", {})
+    d = film_dir(tmp_path)
+    (d / "Film.en.srt").write_text(SRT, encoding="utf-8")
+    c = cache()
+    m.handle(d / "Film.en.srt", c)
+    m.handle(d / "Film.en.srt", c, force=True)        # second pass served from the cache
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    srv = metrics.serve(port, m.CFG["cache"])
+    try:
+        body = urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5).read().decode()
+    finally:
+        srv.shutdown()
+    assert '# TYPE jimaku_llm_requests_total counter' in body
+    assert 'jimaku_llm_requests_total{model="a",outcome="ok"}' in body
+    assert 'jimaku_cues_translated_total{lang="fr"} 4' in body
+    assert 'jimaku_files_written_total{kind="ja.ass"} 2' in body
+    assert 'jimaku_cache_hits_total' in body
+    assert 'jimaku_videos{reason="translated",state="done"} 1' in body

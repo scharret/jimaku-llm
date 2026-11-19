@@ -30,6 +30,8 @@ from pathlib import Path
 
 import requests
 
+from . import metrics
+
 log = logging.getLogger("subtrans")
 
 PROMPT_VERSION = "v1"
@@ -68,6 +70,7 @@ CFG = dict(
     source_langs=[x.strip() for x in env("SOURCE_LANGS", "en,fr").split(",") if x.strip()],
     # Safety net against runaway sources (effect-heavy ASS, broken files): a film has ~1-3k cues.
     max_cues=env("MAX_CUES", 5000, int),
+    metrics_port=env("METRICS_PORT", 9108, int),   # 0 = disabled; only served in scan --watch mode
     video_exts=[e.strip().lower() for e in env("VIDEO_EXTS", ".mkv,.mp4,.m4v,.avi").split(",")],
 )
 
@@ -193,6 +196,13 @@ def _post(url, headers, body):
     return r.json()
 
 
+def _tokens(model, inp, out):
+    if inp:
+        metrics.inc("jimaku_llm_tokens_total", inp, model=model, kind="input")
+    if out:
+        metrics.inc("jimaku_llm_tokens_total", out, model=model, kind="output")
+
+
 def call_llm(model, system, user):
     b = CFG["backend"]
     if b == "gemini":
@@ -202,6 +212,8 @@ def call_llm(model, system, user):
             {"systemInstruction": {"parts": [{"text": system}]},
              "contents": [{"role": "user", "parts": [{"text": user}]}],
              "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"}})
+        u = data.get("usageMetadata") or {}
+        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"))
         try:
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError):
@@ -212,12 +224,16 @@ def call_llm(model, system, user):
                      {"model": model, "temperature": 0.3, "response_format": {"type": "json_object"},
                       "messages": [{"role": "system", "content": system},
                                    {"role": "user", "content": user}]})
+        u = data.get("usage") or {}
+        _tokens(model, u.get("prompt_tokens"), u.get("completion_tokens"))
         return data["choices"][0]["message"]["content"]
     if b == "anthropic":
         data = _post("https://api.anthropic.com/v1/messages",
                      {"x-api-key": CFG["api_key"], "anthropic-version": "2023-06-01"},
                      {"model": model, "max_tokens": 8192, "temperature": 0.3, "system": system,
                       "messages": [{"role": "user", "content": user}]})
+        u = data.get("usage") or {}
+        _tokens(model, u.get("input_tokens"), u.get("output_tokens"))
         return "".join(p.get("text", "") for p in data["content"])
     if b == "dummy":  # offline tests
         items = json.loads(user.split("TRANSLATE:\n", 1)[1])
@@ -259,6 +275,7 @@ def translate_batch(batch, ctx, lang, glossary, cache, src_lang="en"):
     key = hashlib.sha256(json.dumps(key_parts, ensure_ascii=False).encode()).hexdigest()
     hit = cache.get(key)
     if hit:
+        metrics.inc("jimaku_cache_hits_total")
         return hit
     sys_p = system_prompt(lang, glossary, src_lang)
     user = ("CONTEXT (previous lines, source => translation):\n"
@@ -270,22 +287,33 @@ def translate_batch(batch, ctx, lang, glossary, cache, src_lang="en"):
             continue
         for attempt in range(CFG["max_retries"]):
             try:
+                t0 = time.time()
                 try:
-                    out = parse_json_obj(call_llm(model, sys_p, user))
+                    raw = call_llm(model, sys_p, user)
+                finally:
+                    metrics.inc("jimaku_llm_request_seconds_total", time.time() - t0, model=model)
+                try:
+                    out = parse_json_obj(raw)
                 except json.JSONDecodeError as e:
                     raise BadOutput(f"invalid JSON: {e}") from e
                 if not isinstance(out, dict) or set(out) != set(src):
                     raise BadOutput(f"id mismatch ({len(out) if isinstance(out, dict) else '?'}/{len(src)})")
                 out = {k: str(v).replace("\\n", "\n").strip() or src[k] for k, v in out.items()}
                 cache.put(key, out)
+                metrics.inc("jimaku_llm_requests_total", model=model, outcome="ok")
+                metrics.inc("jimaku_cues_translated_total", len(out), lang=lang)
                 return out
             except ModelUnavailable as e:
+                metrics.inc("jimaku_llm_requests_total", model=model, outcome="unavailable")
                 _dead_models.add(model)
                 last_err = e
                 log.error("model %s unavailable, disabling it for this run: %s", model, e)
                 break
             except RetryableError as e:
                 last_err = e
+                outcome = ("quota" if getattr(e, "quota", False) else "overloaded") \
+                    if isinstance(e, Overloaded) else "bad_output"
+                metrics.inc("jimaku_llm_requests_total", model=model, outcome=outcome)
                 if isinstance(e, Overloaded) and e.retry_after:
                     delay = min(CFG["max_backoff"], e.retry_after)
                 elif isinstance(e, Overloaded) and e.quota:
@@ -525,6 +553,7 @@ def handle(path: Path, cache, force=False):
                 mark_ours(dst, cache)
                 log.info("wrote %s (%.0fs)", dst.name, time.time() - t0)
                 written.append(f"{lang} (from {src_lang})")
+                metrics.inc("jimaku_files_written_total", kind=f"{lang}.srt")
                 did = True
 
     if "ja" in CFG["targets"] and CFG["furigana"]:
@@ -539,6 +568,7 @@ def handle(path: Path, cache, force=False):
                 log.info("wrote %s (from %s)", ass.name,
                          "embedded track" if ja_src.parent != base.parent else ja_src.name)
                 written.append("ja.ass")
+                metrics.inc("jimaku_files_written_total", kind="ja.ass")
                 did = True
 
     if problem:
@@ -552,6 +582,7 @@ def handle(path: Path, cache, force=False):
 
 def scan(cache, force=False):
     now = time.time()
+    t_start = now
     n_ok = n_err = 0
     for lib in CFG["libs"]:
         for p in sorted(Path(lib).rglob("*")):
@@ -572,6 +603,8 @@ def scan(cache, force=False):
                 log.error("failed %s: %s", p, e)
     summary = cache.db.execute("SELECT state || '/' || reason, COUNT(*) FROM status "
                                "WHERE state != 'done' GROUP BY 1 ORDER BY 2 DESC").fetchall()
+    metrics.set_gauge("jimaku_scan_duration_seconds", time.time() - t_start)
+    metrics.set_gauge("jimaku_scan_last_success_timestamp_seconds", time.time())
     log.info("scan done: %d processed, %d failed%s", n_ok, n_err,
              ("; not translated: " + ", ".join(f"{k}={v}" for k, v in summary)
               + " (details: subtrans report)") if summary else "")
@@ -626,6 +659,9 @@ def main(argv=None):
             log.error("%s. Progress is cached: rerun the same command later to resume.", e)
             return 75  # EX_TEMPFAIL
         return 0
+    if a.watch and CFG["metrics_port"]:
+        metrics.serve(CFG["metrics_port"], CFG["cache"])
+        log.info("metrics on :%d/metrics", CFG["metrics_port"])
     while True:
         errs = scan(cache, a.force)
         if not a.watch:
