@@ -66,6 +66,8 @@ CFG = dict(
     require_audio=[x.strip() for x in env("REQUIRE_AUDIO_LANGS", "ja").split(",") if x.strip()],
     # Source subtitle languages to translate from, in order of preference.
     source_langs=[x.strip() for x in env("SOURCE_LANGS", "en,fr").split(",") if x.strip()],
+    # Safety net against runaway sources (effect-heavy ASS, broken files): a film has ~1-3k cues.
+    max_cues=env("MAX_CUES", 5000, int),
     video_exts=[e.strip().lower() for e in env("VIDEO_EXTS", ".mkv,.mp4,.m4v,.avi").split(",")],
 )
 
@@ -100,6 +102,8 @@ class Cache:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS status (path TEXT PRIMARY KEY, state TEXT, "
+                        "reason TEXT, detail TEXT, updated REAL)")
 
     def get(self, k):
         row = self.db.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
@@ -108,6 +112,23 @@ class Cache:
     def put(self, k, v):
         self.db.execute("INSERT OR REPLACE INTO kv VALUES (?,?)", (k, json.dumps(v, ensure_ascii=False)))
         self.db.commit()
+
+    def set_status(self, path, state, reason, detail=""):
+        """Last outcome per video (done / skipped / failed), shown by `subtrans report`."""
+        row = self.db.execute("SELECT state, reason, detail FROM status WHERE path=?", (str(path),)).fetchone()
+        if row == (state, reason, detail):
+            return  # unchanged: avoid a write per video on every scan
+        self.db.execute("INSERT OR REPLACE INTO status VALUES (?,?,?,?,?)",
+                        (str(path), state, reason, detail, time.time()))
+        self.db.commit()
+
+    def statuses(self, state=None, reason=None):
+        q, args = "SELECT path, state, reason, detail, updated FROM status WHERE 1=1", []
+        if state:
+            q, args = q + " AND state=?", args + [state]
+        if reason:
+            q, args = q + " AND reason=?", args + [reason]
+        return self.db.execute(q + " ORDER BY state, reason, path", args).fetchall()
 
 
 # ---------------------------------------------------------------- LLM backends
@@ -371,7 +392,8 @@ def extracted_path(video: Path, base: Path, lang):
     if CFG["keep_extracted"] and lang == "en":
         return Path(f"{base}.en.srt")
     h = hashlib.sha1(str(video).encode()).hexdigest()[:16]
-    return Path(CFG["cache"]).parent / "extracted" / f"{h}.{lang}.srt"
+    # "v2": extraction with ASS cleanup; older (uncleaned) extractions are ignored.
+    return Path(CFG["cache"]).parent / "extracted" / f"{h}.v2.{lang}.srt"
 
 
 def _sig(f: Path):
@@ -439,20 +461,24 @@ def handle(path: Path, cache, force=False):
     if not pending_outputs(base, force):
         return False  # everything we would produce already exists
 
+    key = video or base
     streams = probe_cached(video, cache) if video else []
     if video and streams is None:
+        cache.set_status(key, "skipped", "probe_failed", "ffprobe could not read the file")
         return False
     wanted_audio = {normalize(x) for x in CFG["require_audio"]}
     if video and wanted_audio:
         found = audio_langs(streams)
         if not found & wanted_audio:
-            log.debug("skipped %s: no %s audio (found: %s)", video.name,
-                      "/".join(sorted(wanted_audio)), ", ".join(sorted(found)) or "untagged")
+            found_s = ", ".join(sorted(found)) or "untagged"
+            log.debug("skipped %s: no %s audio (found: %s)", video.name, "/".join(sorted(wanted_audio)), found_s)
+            cache.set_status(key, "skipped", "audio_language", f"audio: {found_s}")
             return False
 
     ext = external_subs(base)
     embedded = full_text_sub_langs(streams)
     did = False
+    written, problem = [], None
 
     todo = []
     for lang in CFG["targets"]:
@@ -473,8 +499,20 @@ def handle(path: Path, cache, force=False):
             if src:
                 src_lang = cand
                 break
+        n_cues = len(parse_srt(src)) if src is not None else 0
         if src is None:
+            from .embedded import IMAGE_CODECS, aliases
+            src_codes = set().union(*(aliases(lang) for lang in CFG["source_langs"]))
+            image_only = any(s.get("codec_type") == "subtitle" and s.get("codec_name") in IMAGE_CODECS
+                             and ((s.get("tags") or {}).get("language") or "").lower() in src_codes
+                             for s in streams or [])
             log.info("no usable %s subtitle for %s", "/".join(CFG["source_langs"]), base.name)
+            problem = ("image_subs_only", "PGS/VobSub only, OCR needed") if image_only else \
+                ("no_source", f"no {'/'.join(CFG['source_langs'])} text subtitle")
+        elif n_cues > CFG["max_cues"]:
+            log.error("skipping %s: source %s has %d cues (> MAX_CUES=%d), probably effects/karaoke. "
+                      "Check the file or raise MAX_CUES.", base.name, src.name, n_cues, CFG["max_cues"])
+            problem = ("too_many_cues", f"{src.name}: {n_cues} cues > MAX_CUES={CFG['max_cues']}")
         else:
             for lang in todo:
                 if lang == src_lang:
@@ -486,6 +524,7 @@ def handle(path: Path, cache, force=False):
                 write_atomic(dst, render_srt(cues))
                 mark_ours(dst, cache)
                 log.info("wrote %s (%.0fs)", dst.name, time.time() - t0)
+                written.append(f"{lang} (from {src_lang})")
                 did = True
 
     if "ja" in CFG["targets"] and CFG["furigana"]:
@@ -499,7 +538,15 @@ def handle(path: Path, cache, force=False):
                 write_atomic(ass, cues_to_ass(parse_srt(ja_src), title=base.name), encoding="utf-8-sig")
                 log.info("wrote %s (from %s)", ass.name,
                          "embedded track" if ja_src.parent != base.parent else ja_src.name)
+                written.append("ja.ass")
                 did = True
+
+    if problem:
+        cache.set_status(key, "skipped", *problem)
+    elif written:
+        cache.set_status(key, "done", "translated", ", ".join(written))
+    else:
+        cache.set_status(key, "done", "already_available", "subtitles already present")
     return did
 
 
@@ -516,13 +563,37 @@ def scan(cache, force=False):
                 if handle(p, cache, force):
                     n_ok += 1
             except ProviderBusy as e:  # hitting the next files would fail the same way
+                cache.set_status(p, "failed", "provider_busy", str(e)[:300])
                 log.error("stopping scan: %s; progress is cached, next scan resumes", e)
                 return n_err + 1
             except Exception as e:  # one failing file must not block the rest
                 n_err += 1
+                cache.set_status(p, "failed", "error", f"{type(e).__name__}: {e}"[:300])
                 log.error("failed %s: %s", p, e)
-    log.info("scan done: %d processed, %d failed", n_ok, n_err)
+    summary = cache.db.execute("SELECT state || '/' || reason, COUNT(*) FROM status "
+                               "WHERE state != 'done' GROUP BY 1 ORDER BY 2 DESC").fetchall()
+    log.info("scan done: %d processed, %d failed%s", n_ok, n_err,
+             ("; not translated: " + ", ".join(f"{k}={v}" for k, v in summary)
+              + " (details: subtrans report)") if summary else "")
     return n_err
+
+
+def report(cache, a):
+    rows = cache.statuses(a.state, a.reason)
+    if not (a.all or a.state or a.reason):
+        rows = [r for r in rows if r[1] != "done" and r[2] != "audio_language"]
+    if a.json:
+        print(json.dumps([dict(zip(("path", "state", "reason", "detail", "updated"), r)) for r in rows],
+                         ensure_ascii=False, indent=2))
+        return 0
+    counts = {}
+    for _, state, reason, _, _ in cache.statuses():
+        counts[(state, reason)] = counts.get((state, reason), 0) + 1
+    print("summary: " + ", ".join(f"{s}/{r}={n}" for (s, r), n in sorted(counts.items())))
+    for path, state, reason, detail, updated in rows:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(updated))
+        print(f"{when}  {state:<7} {reason:<17} {Path(path).name}\n{'':42}{detail}")
+    return 0
 
 
 def main(argv=None):
@@ -535,9 +606,16 @@ def main(argv=None):
     s = sub.add_parser("scan", help="walk LIBRARY_PATHS for video files")
     s.add_argument("--watch", type=int, default=0, help="rescan every N seconds")
     s.add_argument("--force", action="store_true")
+    r = sub.add_parser("report", help="show the last outcome of every video (skipped/failed/done)")
+    r.add_argument("--state", choices=["done", "skipped", "failed"])
+    r.add_argument("--reason", help="e.g. too_many_cues, no_source, image_subs_only, audio_language")
+    r.add_argument("--all", action="store_true", help="include done and audio_language rows")
+    r.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    if a.cmd == "report":
+        return report(Cache(CFG["cache"]), a)
     if CFG["backend"] not in ("dummy", "openai") and not CFG["api_key"]:
         sys.exit("API_KEY is missing")
     cache = Cache(CFG["cache"])

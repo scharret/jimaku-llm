@@ -44,13 +44,37 @@ For every video under `LIBRARY_PATHS`:
 3. **Source subtitles** — the first language of `SOURCE_LANGS` (default `en,fr`) that is available:
    an external file (`X.en.srt`, `X.fre.srt`…), otherwise the **embedded** text track, extracted with
    `ffprobe`/`ffmpeg` (SubRip preferred over ASS, plain over SDH). Image-based tracks (PGS, VobSub)
-   would need OCR and are skipped. Files we generated ourselves are **never** used as a source
+   would need OCR and are skipped. Embedded **ASS** tracks are cleaned before translation: signs, songs/karaoke
+   and animated effect lines are dropped and layered duplicates merged (a fansub track can hold 100k+ effect
+   events for ~1.5k dialogue lines). Files we generated ourselves are **never** used as a source
    (no translation of a translation); if Bazarr later replaces one with a real subtitle, it becomes eligible again.
    The extracted copy stays in the cache dir (`KEEP_EXTRACTED=1` writes `X.en.srt` next to the video instead).
 4. **Furigana** — `X.ja.ass` is built from **real Japanese subtitles** when the video has some (embedded or external),
    and only falls back to our own Japanese translation otherwise.
 
 `ffprobe` results are cached by path/size/mtime, so periodic rescans of a large library do not re-read the files.
+
+## What was skipped, and why
+
+Every video's last outcome is stored in the cache DB, and each scan ends with a one-line summary
+(`not translated: skipped/no_source=23, skipped/too_many_cues=1 …`). Details:
+
+```bash
+docker compose run --rm subtrans report                        # everything not done (audio filter hidden)
+docker compose run --rm subtrans report --reason too_many_cues
+docker compose run --rm subtrans report --all --json           # machine-readable
+```
+
+| state / reason | meaning |
+|---|---|
+| `skipped/audio_language` | no audio track in `REQUIRE_AUDIO_LANGS` (or untagged) |
+| `skipped/no_source` | no text subtitle in `SOURCE_LANGS` |
+| `skipped/image_subs_only` | only PGS/VobSub source subtitles (OCR needed) |
+| `skipped/too_many_cues` | source above `MAX_CUES` |
+| `skipped/probe_failed` | ffprobe could not read the file |
+| `failed/provider_busy` | all models overloaded / out of quota (resumes next scan) |
+| `failed/error` | unexpected error, message in `detail` |
+| `done/translated`, `done/already_available` | OK |
 
 ## Reliability
 
@@ -107,6 +131,7 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `MODELS` | `gemini-3.8-flash` | comma-separated, tried in order |
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
+| `MAX_CUES` | `5000` | safety net: sources with more cues are skipped (runaway effects, broken files) |
 | `SOURCE_LANGS` | `en,fr` | source subtitle languages, in order of preference |
 | `REQUIRE_AUDIO_LANGS` | `ja` | only process videos with one of these audio languages; empty = all |
 | `EXTRACT_EMBEDDED` | `1` | fall back to the embedded English track |

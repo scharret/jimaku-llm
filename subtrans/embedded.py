@@ -108,14 +108,30 @@ def extract_srt(video: Path, dest: Path, lang, streams=None):
     track = pick_text_track(streams if streams is not None else probe(video), lang)
     if track is None:
         return False
-    tmp = Path(str(dest) + ".tmp.srt")
     dest.parent.mkdir(parents=True, exist_ok=True)
     log.info("extracting embedded %s subtitle stream #%s (%s) from %s",
              lang, track["index"], track.get("codec_name"), video.name)
-    subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(video),
-         "-map", f"0:{track['index']}", "-c:s", "srt", str(tmp)],
-        check=True, timeout=1800)
+    tmp = Path(str(dest) + ".tmp.srt")
+    if track.get("codec_name") in ("ass", "ssa"):
+        # Keep the ASS as-is and clean it ourselves: a plain ffmpeg conversion turns every
+        # karaoke/sign effect line into a cue (100k+ cues on some fansubs).
+        from .ass_clean import ass_to_cues, render_srt
+        raw = Path(str(dest) + ".tmp.ass")
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(video),
+             "-map", f"0:{track['index']}", "-c:s", "copy", str(raw)],
+            check=True, timeout=1800)
+        cues, stats = ass_to_cues(raw.read_text(encoding="utf-8-sig", errors="replace"))
+        raw.unlink()
+        log.info("ASS cleanup: %d events -> %d dialogue cues", stats["events"], stats["cues"])
+        if not cues:
+            return False
+        tmp.write_text(render_srt(cues), encoding="utf-8")
+    else:
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(video),
+             "-map", f"0:{track['index']}", "-c:s", "srt", str(tmp)],
+            check=True, timeout=1800)
     if tmp.stat().st_size == 0:
         tmp.unlink()
         return False
