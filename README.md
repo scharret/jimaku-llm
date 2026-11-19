@@ -55,8 +55,13 @@ For every video under `LIBRARY_PATHS`:
 - **Idempotent**: an existing output is never overwritten (`--force` to redo). A human-made subtitle
   downloaded by Bazarr always wins.
 - **Resumable**: every translated batch is cached in SQLite — a 503 halfway through a film only costs the current batch.
-- **Resilient**: exponential backoff + jitter on 408/429/5xx, fallback to the next model in `MODELS`,
-  then batch bisection if the model keeps returning broken JSON.
+- **Resilient**:
+  - capacity errors (429, 5xx, timeouts): backoff honouring `Retry-After`, longer waits on 429 (quota windows),
+    then the next model in `MODELS`. If every model is overloaded, the run **stops cleanly** instead of hammering
+    the API: `file` exits with code `75` (EX_TEMPFAIL) and `scan` stops until the next cycle. Progress is cached,
+    rerunning resumes where it stopped;
+  - broken output (invalid JSON, missing ids): retry, then split the batch in half;
+  - retired model (404): disabled for the rest of the run.
 - **Atomic writes** (`.tmp` + rename): the media server never sees a half-written file.
 - Ignores sources modified less than `SETTLE_S` ago (Bazarr still writing).
 - The API key is sent as a header, never in the URL, so it does not leak into proxy/app logs.
@@ -107,6 +112,8 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `FURIGANA` | `1` | generate `.ja.ass` |
 | `BATCH_SIZE` / `CONTEXT_CUES` | `60` / `8` | |
 | `MAX_RETRIES` / `MIN_INTERVAL_S` | `6` / `1.0` | per model / seconds between requests |
+| `MAX_BACKOFF_S` | `300` | longest wait between retries |
+| `HTTP_TIMEOUT_S` | `180` | raise it for slow "thinking" models |
 | `LIBRARY_PATHS` | `/media` | `:`-separated |
 | `SETTLE_S` | `120` | |
 | `CACHE_DB` | `/cache/subtrans.db` | |
