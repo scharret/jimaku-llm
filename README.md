@@ -41,10 +41,12 @@ For every video under `LIBRARY_PATHS`:
 2. **Existing subtitles win** — a target language is skipped when subtitles already exist, either
    - next to the video, with Bazarr/Radarr naming: `X.fr.srt`, `X.fre.srt`, `X.fra.hi.srt`, `X.ja.ass`… (`*.forced.*` does not count), or
    - embedded in the container as a full text track (not forced, not "Signs & Songs").
-3. **English source** — an external `X.en.srt` / `X.eng.srt`, otherwise the **embedded** English text track,
-   extracted with `ffprobe`/`ffmpeg` (SubRip preferred over ASS, plain over SDH). Image-based tracks
-   (PGS, VobSub) would need OCR and are skipped. The extracted copy stays in the cache dir
-   (`KEEP_EXTRACTED=1` writes `X.en.srt` next to the video instead).
+3. **Source subtitles** — the first language of `SOURCE_LANGS` (default `en,fr`) that is available:
+   an external file (`X.en.srt`, `X.fre.srt`…), otherwise the **embedded** text track, extracted with
+   `ffprobe`/`ffmpeg` (SubRip preferred over ASS, plain over SDH). Image-based tracks (PGS, VobSub)
+   would need OCR and are skipped. Files we generated ourselves are **never** used as a source
+   (no translation of a translation); if Bazarr later replaces one with a real subtitle, it becomes eligible again.
+   The extracted copy stays in the cache dir (`KEEP_EXTRACTED=1` writes `X.en.srt` next to the video instead).
 4. **Furigana** — `X.ja.ass` is built from **real Japanese subtitles** when the video has some (embedded or external),
    and only falls back to our own Japanese translation otherwise.
 
@@ -105,6 +107,7 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `MODELS` | `gemini-3.8-flash` | comma-separated, tried in order |
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
+| `SOURCE_LANGS` | `en,fr` | source subtitle languages, in order of preference |
 | `REQUIRE_AUDIO_LANGS` | `ja` | only process videos with one of these audio languages; empty = all |
 | `EXTRACT_EMBEDDED` | `1` | fall back to the embedded English track |
 | `KEEP_EXTRACTED` | `0` | `1` = write the extracted `<video>.en.srt` next to the video |

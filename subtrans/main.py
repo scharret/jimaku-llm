@@ -1,11 +1,12 @@
-"""subtrans — translate English subtitles into other languages with an LLM.
+"""subtrans — translate subtitles (English, else French) into other languages with an LLM.
 
 For every video under LIBRARY_PATHS:
   1. skip it unless it has an audio track in REQUIRE_AUDIO_LANGS (default: Japanese);
   2. for each TARGET_LANGS language, skip it if subtitles already exist, either next to
      the video (X.fr.srt, X.fre.srt, X.fra.hi.srt...) or embedded as a text track;
-  3. otherwise translate the English source: an external X.en.srt, else the embedded
-     English text track (extracted with ffmpeg; image-based PGS/VobSub are skipped);
+  3. otherwise translate from the first available SOURCE_LANGS subtitle (default: en, then fr):
+     an external file, else the embedded text track (extracted with ffmpeg; image-based
+     PGS/VobSub are skipped). Our own machine translations are never used as a source;
   4. build X.ja.ass with furigana, preferring real Japanese subtitles over our translation.
 
 Modes:
@@ -63,6 +64,8 @@ CFG = dict(
     keep_extracted=env("KEEP_EXTRACTED", "0") == "1",   # 1 = also write <video>.en.srt next to the video
     # Only process videos having an audio track in one of these languages ("" = no filter).
     require_audio=[x.strip() for x in env("REQUIRE_AUDIO_LANGS", "ja").split(",") if x.strip()],
+    # Source subtitle languages to translate from, in order of preference.
+    source_langs=[x.strip() for x in env("SOURCE_LANGS", "en,fr").split(",") if x.strip()],
     video_exts=[e.strip().lower() for e in env("VIDEO_EXTS", ".mkv,.mp4,.m4v,.avi").split(",")],
 )
 
@@ -208,9 +211,10 @@ def parse_json_obj(text):
 
 
 # ---------------------------------------------------------------- translation
-def system_prompt(lang, glossary):
+def system_prompt(lang, glossary, src_lang="en"):
     name = LANG_NAMES.get(lang, lang)
-    p = (f"You are a professional subtitle translator. Translate English subtitles into natural, "
+    src_name = LANG_NAMES.get(src_lang, "English" if src_lang == "en" else src_lang)
+    p = (f"You are a professional subtitle translator. Translate {src_name} subtitles into natural, "
          f"spoken {name} suitable for on-screen subtitles (concise, readable).\n"
          "Rules:\n"
          "- Input is a JSON object {id: text}. Output ONLY a JSON object with exactly the same ids.\n"
@@ -218,24 +222,24 @@ def system_prompt(lang, glossary):
          "- Keep tags like <i>...</i> unchanged.\n"
          "- Use the CONTEXT only for continuity; do not translate or output it.\n"
          "- Keep character names and invented terms consistent across the whole film.\n"
-         "- Fix obvious errors in the English source rather than translating them literally.\n")
+         "- Fix obvious errors in the source rather than translating them literally.\n")
     if lang == "ja":
         p += "- Use natural casual Japanese for children, polite forms for staff/servants/adults addressing guests. Use full-width punctuation.\n"
     if lang == "fr":
         p += "- Children tutoient each other; staff and strangers vouvoient.\n"
     if glossary:
-        p += f"\nGlossary (English => preferred term):\n{glossary}\n"
+        p += f"\nGlossary (source term => preferred term):\n{glossary}\n"
     return p
 
 
-def translate_batch(batch, ctx, lang, glossary, cache):
+def translate_batch(batch, ctx, lang, glossary, cache, src_lang="en"):
     src = {str(i): t for i, _, t in batch}
-    key = hashlib.sha256(json.dumps([PROMPT_VERSION, lang, glossary, ctx, src],
-                                    ensure_ascii=False).encode()).hexdigest()
+    key_parts = [PROMPT_VERSION, lang, glossary, ctx, src] + ([src_lang] if src_lang != "en" else [])
+    key = hashlib.sha256(json.dumps(key_parts, ensure_ascii=False).encode()).hexdigest()
     hit = cache.get(key)
     if hit:
         return hit
-    sys_p = system_prompt(lang, glossary)
+    sys_p = system_prompt(lang, glossary, src_lang)
     user = ("CONTEXT (previous lines, source => translation):\n"
             + "\n".join(f"{s} => {t}" for s, t in ctx)
             + "\n\nTRANSLATE:\n" + json.dumps(src, ensure_ascii=False))
@@ -281,9 +285,9 @@ def translate_batch(batch, ctx, lang, glossary, cache):
     # Broken output: split the batch in half (large batches break the JSON more often)
     if len(batch) > 8:
         mid = len(batch) // 2
-        a = translate_batch(batch[:mid], ctx, lang, glossary, cache)
+        a = translate_batch(batch[:mid], ctx, lang, glossary, cache, src_lang)
         tail_ctx = (ctx + [(batch[j][2], a[str(batch[j][0])]) for j in range(mid)])[-CFG["context"]:]
-        return {**a, **translate_batch(batch[mid:], tail_ctx, lang, glossary, cache)}
+        return {**a, **translate_batch(batch[mid:], tail_ctx, lang, glossary, cache, src_lang)}
     raise RuntimeError(f"batch {batch[0][0]}-{batch[-1][0]} failed to translate: {last_err}")
 
 
@@ -295,13 +299,13 @@ def load_glossary(srt_path):
     return "\n".join(parts)
 
 
-def translate_file(src_path, lang, cache):
+def translate_file(src_path, lang, cache, src_lang="en"):
     cues = parse_srt(src_path)
     glossary = load_glossary(src_path)
     out, ctx = {}, []
     for i in range(0, len(cues), CFG["batch"]):
         batch = cues[i:i + CFG["batch"]]
-        res = translate_batch(batch, ctx[-CFG["context"]:], lang, glossary, cache)
+        res = translate_batch(batch, ctx[-CFG["context"]:], lang, glossary, cache, src_lang)
         out.update(res)
         ctx += [(t, res[str(n)]) for n, _, t in batch]
         log.info("  %s: %d/%d", lang, min(i + CFG["batch"], len(cues)), len(cues))
@@ -370,10 +374,28 @@ def extracted_path(video: Path, base: Path, lang):
     return Path(CFG["cache"]).parent / "extracted" / f"{h}.{lang}.srt"
 
 
-def find_srt(lang, base: Path, video: Path | None, streams, ext, cache: Cache):
-    """An SRT in `lang`: external file first, else the embedded text track (extracted with ffmpeg)."""
+def _sig(f: Path):
+    st = f.stat()
+    return [st.st_size, int(st.st_mtime)]
+
+
+def mark_ours(f: Path, cache: Cache):
+    """Remember that we produced this file (machine translation)."""
+    cache.put(f"ours:{f}", _sig(f))
+
+
+def is_ours(f: Path, cache: Cache):
+    """True if the file is still the one we wrote (Bazarr replacing it changes size/mtime)."""
+    return cache.get(f"ours:{f}") == _sig(f)
+
+
+def find_srt(lang, base: Path, video: Path | None, streams, ext, cache: Cache, exclude_ours=False):
+    """An SRT in `lang`: external file first, else the embedded text track (extracted with ffmpeg).
+
+    exclude_ours: skip files we generated, so a translation is never used as a translation source.
+    """
     for f in ext.get(lang, []):
-        if f.suffix.lower() == ".srt":
+        if f.suffix.lower() == ".srt" and not (exclude_ours and is_ours(f, cache)):
             return f
     if not (video and streams and CFG["extract_embedded"]):
         return None
@@ -443,16 +465,26 @@ def handle(path: Path, cache, force=False):
             todo.append(lang)
 
     if todo:
-        src = find_srt("en", base, video, streams, ext, cache)
+        src_lang, src = None, None
+        for cand in CFG["source_langs"]:
+            if cand in todo:
+                continue  # can't be both missing and the source
+            src = find_srt(cand, base, video, streams, ext, cache, exclude_ours=True)
+            if src:
+                src_lang = cand
+                break
         if src is None:
-            log.info("no usable English subtitle for %s", base.name)
+            log.info("no usable %s subtitle for %s", "/".join(CFG["source_langs"]), base.name)
         else:
             for lang in todo:
+                if lang == src_lang:
+                    continue
                 dst = Path(f"{base}.{lang}.srt")
-                log.info("translating %s -> %s", base.name, lang)
+                log.info("translating %s (%s) -> %s", base.name, src_lang, lang)
                 t0 = time.time()
-                cues = translate_file(src, lang, cache)
+                cues = translate_file(src, lang, cache, src_lang)
                 write_atomic(dst, render_srt(cues))
+                mark_ours(dst, cache)
                 log.info("wrote %s (%.0fs)", dst.name, time.time() - t0)
                 did = True
 
