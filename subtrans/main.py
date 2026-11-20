@@ -297,7 +297,9 @@ def call_vision(model, prompt, items):
 def vision_batch(lang, items, cache):
     """OCR a batch of subtitle images with a vision model; same retry/fallback rules as translation."""
     from .ocr import images_key, vision_prompt
-    key = "ocr:" + images_key(items) + ":" + lang
+    prompt = vision_prompt(lang)
+    # The prompt is part of the key: improving it must not keep serving old cached transcriptions.
+    key = "ocr:" + images_key(items) + ":" + lang + ":" + hashlib.sha1(prompt.encode()).hexdigest()[:8]
     hit = cache.get(key)
     if hit:
         metrics.inc("jimaku_cache_hits_total")
@@ -310,7 +312,7 @@ def vision_batch(lang, items, cache):
         for attempt in range(CFG["max_retries"]):
             try:
                 try:
-                    out = parse_json_obj(call_vision(model, vision_prompt(lang), items))
+                    out = parse_json_obj(call_vision(model, prompt, items))
                 except json.JSONDecodeError as e:
                     raise BadOutput(f"invalid JSON: {e}") from e
                 if not isinstance(out, dict) or not set(out) <= ids:
