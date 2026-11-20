@@ -14,6 +14,20 @@ OVERRIDES = {
 FS, RFS, X0 = 64, 30, 960
 LINE_H = FS + RFS + 14
 
+# libass (Jellyfin web, mpv, ffmpeg burn-in) scales a font so that its line height,
+# usWinAscent + usWinDescent, equals the style Fontsize. For Noto Sans CJK JP that is
+# 1160 + 288 = 1448 units, so one em (the advance of a kanji) is Fontsize / 1.448.
+EM_RATIO = 1000 / 1448
+# Advance widths of printable ASCII (U+0020..U+007E) in Noto Sans CJK JP, per 1000 em.
+_ASCII_ADV = (
+    224, 323, 474, 555, 555, 921, 680, 278, 338, 338, 467, 555, 278, 347, 278, 392,
+    555, 555, 555, 555, 555, 555, 555, 555, 555, 555, 278, 278, 555, 555, 555, 474,
+    946, 608, 657, 638, 688, 589, 552, 689, 728, 293, 535, 646, 543, 812, 723, 742,
+    633, 742, 635, 596, 599, 721, 575, 878, 573, 531, 603, 338, 392, 338, 555, 559,
+    606, 563, 618, 510, 620, 554, 325, 564, 607, 275, 275, 552, 284, 926, 610, 606,
+    620, 620, 388, 468, 377, 607, 521, 802, 498, 521, 475, 338, 270, 338, 555,
+)
+
 HEADER = f"""[Script Info]
 Title: {{title}}
 ScriptType: v4.00+
@@ -48,7 +62,12 @@ def _is_kanji(c):
 
 
 def _width(c):
-    return 1.0 if unicodedata.east_asian_width(c) in "WFA" else 0.5
+    """Advance width of a character, in em."""
+    o = ord(c)
+    if 0x20 <= o <= 0x7E:
+        return _ASCII_ADV[o - 0x20] / 1000
+    eaw = unicodedata.east_asian_width(c)
+    return 1.0 if eaw in "WFA" else 0.5 if eaw == "H" else 0.55
 
 
 def ruby_segments(line):
@@ -56,6 +75,8 @@ def ruby_segments(line):
     segs = []
     toks = list(_tagger()(line))
     for i, m in enumerate(toks):
+        if m.white_space:  # MeCab drops spaces from surfaces; keep them for the layout
+            segs.append((m.white_space, None))
         s = m.surface
         r = OVERRIDES.get(s) or _hira(m.feature.kana or "")
         if s == "何":  # なに vs なん depending on what follows
@@ -85,6 +106,38 @@ def _ts(tc):
     return f"{int(h)}:{m}:{s}.{ms[:2]}"
 
 
+def _base(start, end, x, y, text):
+    """Base text left-aligned at x. libass drops leading spaces, so skip over them here."""
+    lead = len(text) - len(text.lstrip())
+    x += sum(_width(c) for c in text[:lead]) * FS * EM_RATIO
+    text = text.strip()
+    return f"Dialogue: 0,{start},{end},Base,,0,0,0,,{{\\an1\\pos({x:.0f},{y})}}{text}" if text else None
+
+
+def _line_events(line, start, end, y):
+    """Each kanji word is its own event, with its ruby centred on it: an error in the
+    assumed glyph widths shifts whole words slightly but never moves a ruby off its kanji."""
+    em, rem = FS * EM_RATIO, RFS * EM_RATIO
+    segs = ruby_segments(line)
+    widths = [sum(_width(c) for c in s) * em for s, _ in segs]
+    x = X0 - sum(widths) / 2
+    events, run, run_x = [], "", x
+    for (s, r), sw in zip(segs, widths):
+        if r:
+            events += [_base(start, end, run_x, y, run), _base(start, end, x, y, s)]
+            room, need = max(sw, em), len(r) * rem
+            sc = min(100, int(100 * room / need)) if need > room * 1.15 else 100
+            events.append(
+                f"Dialogue: 1,{start},{end},Ruby,,0,0,0,,"
+                f"{{\\an2\\pos({x + sw / 2:.0f},{y - FS - 2})\\fscx{sc}}}{r}")
+            run, run_x = "", x + sw
+        else:
+            run += s
+        x += sw
+    events.append(_base(start, end, run_x, y, run))
+    return [e for e in events if e]
+
+
 def cues_to_ass(cues, title="subs"):
     """cues: [(idx, '00:00:01,000 --> 00:00:02,000', 'texte\\nligne2')]"""
     import re
@@ -95,17 +148,5 @@ def cues_to_ass(cues, title="subs"):
         n = len(lines)
         for i, line in enumerate(lines):
             y = 1080 - 50 - (n - 1 - i) * LINE_H
-            segs = ruby_segments(line)
-            x = X0 - sum(_width(c) for s, _ in segs for c in s) * FS / 2
-            events.append(f"Dialogue: 0,{start},{end},Base,,0,0,0,,{{\\an2\\pos({X0},{y})}}{line}")
-            for s, r in segs:
-                sw = sum(_width(c) for c in s) * FS
-                if r:
-                    room = max(sw, FS)
-                    need = len(r) * RFS
-                    sc = min(100, int(100 * room / need)) if need > room * 1.15 else 100
-                    events.append(
-                        f"Dialogue: 1,{start},{end},Ruby,,0,0,0,,"
-                        f"{{\\an2\\pos({x + sw / 2:.0f},{y - FS - 2})\\fscx{sc}}}{r}")
-                x += sw
+            events.extend(_line_events(line, start, end, y))
     return HEADER.replace("{title}", title) + "\n".join(events) + "\n"
