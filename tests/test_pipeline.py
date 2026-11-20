@@ -462,7 +462,11 @@ def test_metrics_exposition(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- OCR (PGS)
 from tests.pgs_encode import encode as encode_pgs  # noqa: E402
 
-LATIN_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+# DejaVu Sans Bold lives in a different place per distro (Debian/Ubuntu in CI, Arch, Fedora).
+LATIN_FONT = next((f for f in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                               "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+                               "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf")
+                   if os.path.exists(f)), "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 needs_tesseract = pytest.mark.skipif(not shutil.which("tesseract") or not os.path.exists(LATIN_FONT),
                                      reason="tesseract or test font missing")
 PGS_SUBS = [(1.0, 2.5, "Where is Conan?"), (3.0, 4.5, "I don't know.")]
@@ -660,3 +664,15 @@ def test_gemini_request_carries_thinking_level(monkeypatch):
     m.call_llm("gemini-3.8-flash", "sys", "user")
     assert sent["url"].endswith("/gemini-3.8-flash:generateContent")
     assert sent["body"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
+
+
+# ---------------------------------------------------------------- CLI
+@pytest.mark.parametrize("argv, verbose", [
+    (["-v", "file", "X.mkv"], True),        # before the subcommand
+    (["file", "X.mkv", "-v"], True),        # after it, as in the README / docker compose run
+    (["-v", "scan", "--watch", "60"], True),
+    (["file", "X.mkv"], False),
+    (["report"], False),
+])
+def test_cli_verbose_flag_position(argv, verbose):
+    assert m.build_parser().parse_args(argv).verbose is verbose

@@ -107,7 +107,7 @@ def pick_text_track(streams, lang):
     text = [s for s in subs if s.get("codec_name") in TEXT_CODECS]
     if not text:
         if any(s.get("codec_name") in IMAGE_CODECS for s in subs):
-            log.info("only image-based %s subs (PGS/VobSub): OCR not supported, skipping", lang)
+            log.debug("no %s text track, only image-based (PGS/VobSub): left to OCR", lang)
         return None
     usable = [s for s in text
               if not _is_forced(s) and not _skip_title(s)]
