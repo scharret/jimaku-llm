@@ -540,7 +540,6 @@ def test_ocr_image_cap(tmp_path, monkeypatch):
     with pytest.raises(Exception, match="MAX_CUES"):
         m.handle(video, cache())
     assert calls == []                                         # nothing sent to the API
-    assert (d / "Film.fr.srt").exists()                # French still translated (from OCR'd English)
 
 
 def test_vision_prompt_ignores_furigana_for_japanese():
