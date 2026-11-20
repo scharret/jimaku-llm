@@ -47,6 +47,9 @@ def cfg(tmp_path, monkeypatch):
     monkeypatch.setitem(m.CFG, "libs", [str(tmp_path / "lib")])
     monkeypatch.setitem(m.CFG, "settle", 0)
     monkeypatch.setitem(m.CFG, "require_audio", ["ja"])
+    monkeypatch.setattr(m, "_next_slot", [0.0])
+    monkeypatch.setattr(m, "_cooldown_until", [0.0])
+    m._stop.clear()
     (tmp_path / "lib" / "Film").mkdir(parents=True)
     return tmp_path
 
@@ -481,3 +484,93 @@ def test_pgs_japanese_uses_vision_and_is_not_translated(tmp_path):
     ass = (d / "Film.ja.ass").read_text(encoding="utf-8-sig")
     assert "[vision a] 1" in ass                       # furigana built from the OCR'd Japanese (vision engine)
     assert (d / "Film.fr.srt").exists()                # French still translated (from OCR'd English)
+
+
+# ---------------------------------------------------------------- parallelism
+def test_parallel_workers_and_languages(tmp_path, monkeypatch):
+    import threading as th
+    monkeypatch.setitem(m.CFG, "workers", 3)
+    monkeypatch.setitem(m.CFG, "parallel_langs", True)
+    monkeypatch.setitem(m.CFG, "require_audio", [])
+    real, active, peak = m.call_llm, [0], [0]
+    lock = th.Lock()
+
+    def slow(model, s, u):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            return real(model, s, u)
+        finally:
+            with lock:
+                active[0] -= 1
+
+    monkeypatch.setattr(m, "call_llm", slow)
+    lib = tmp_path / "lib"
+    for i in range(5):
+        d = lib / f"Film{i}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"Film{i}.en.srt").write_text(SRT, encoding="utf-8")
+        (d / f"Film{i}.mkv").write_bytes(b"")
+    monkeypatch.setattr(m, "probe_cached", lambda video, cache: [])
+    c = cache()
+    assert m.scan(c) == 0
+    for i in range(5):
+        d = lib / f"Film{i}"
+        assert len(m.parse_srt(d / f"Film{i}.fr.srt")) == 4
+        assert (d / f"Film{i}.ja.ass").exists()
+    assert len(c.statuses(state="done")) == 5
+
+
+def test_provider_busy_stops_all_workers(tmp_path, monkeypatch):
+    monkeypatch.setitem(m.CFG, "workers", 2)
+    monkeypatch.setitem(m.CFG, "require_audio", [])
+    calls = []
+
+    def busy(model, s, u):
+        calls.append(model)
+        raise m.Overloaded("HTTP 429", quota=True)
+
+    monkeypatch.setattr(m, "call_llm", busy)
+    monkeypatch.setattr(m, "cooldown", lambda s: None)
+    monkeypatch.setattr(m, "probe_cached", lambda video, cache: [])
+    lib = tmp_path / "lib"
+    for i in range(6):
+        d = lib / f"Film{i}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"Film{i}.en.srt").write_text(SRT, encoding="utf-8")
+        (d / f"Film{i}.mkv").write_bytes(b"")
+    assert m.scan(cache()) >= 1
+    # at most the in-flight videos x languages hit the API before everyone stops
+    assert len(calls) <= 2 * 2 * 2 * m.CFG["max_retries"]
+
+
+def test_rate_limiter_spacing(monkeypatch):
+    import threading as th
+    import time as _t
+    monkeypatch.setitem(m.CFG, "min_interval", 0.0)
+    monkeypatch.setitem(m.CFG, "max_rpm", 600)          # 0.1 s between requests, globally
+    monkeypatch.setattr(m, "_next_slot", [0.0])
+    monkeypatch.setattr(m, "_cooldown_until", [0.0])
+    monkeypatch.undo()                                   # use the real time.sleep for this test
+    monkeypatch.setitem(m.CFG, "min_interval", 0.0)
+    monkeypatch.setitem(m.CFG, "max_rpm", 600)
+    monkeypatch.setattr(m, "_next_slot", [0.0])
+    monkeypatch.setattr(m, "_cooldown_until", [0.0])
+    stamps = []
+    lock = th.Lock()
+
+    def go():
+        m._throttle()
+        with lock:
+            stamps.append(_t.time())
+
+    threads = [th.Thread(target=go) for _ in range(6)]
+    t0 = _t.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    stamps.sort()
+    assert stamps[-1] - t0 >= 0.45                      # 6 requests need >= 5 intervals
+    assert all(b - a >= 0.08 for a, b in zip(stamps, stamps[1:]))

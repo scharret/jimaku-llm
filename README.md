@@ -92,11 +92,20 @@ The Kubernetes CronJob runs one-shot scans and does not expose metrics.
 | `jimaku_cues_translated_total` | counter | `lang` |
 | `jimaku_files_written_total` | counter | `kind` (e.g. `fr.srt`, `ja.ass`) |
 | `jimaku_ocr_cues_total` | counter | `lang`, `engine` = tesseract / vision |
+| `jimaku_active_tasks` | gauge | |
 | `jimaku_videos` | gauge | `state`, `reason` (same as `subtrans report`, persisted) |
 | `jimaku_scan_duration_seconds`, `jimaku_scan_last_success_timestamp_seconds` | gauge | |
 
 Counters reset on restart (use `increase()`/`rate()`). Scrape config and alert rules
 (stale scan, quota exhausted, high failure ratio, skipped files) are in [`deploy/prometheus/`](deploy/prometheus/).
+
+## Parallelism
+
+Batches of one video stay sequential (each batch gets the previous translations as context, which keeps
+names and register consistent). What runs in parallel: the target languages of a video (`PARALLEL_LANGS`)
+and several videos (`WORKERS`). All workers share one rate limiter (`MAX_RPM` / `MIN_INTERVAL_S`), a 429/5xx
+puts **every** worker on cooldown, and a `ProviderBusy` stops them all. Example for a paid Gemini key:
+`WORKERS=3 MAX_RPM=60`.
 
 ## Reliability
 
@@ -164,7 +173,10 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `VIDEO_EXTS` | `.mkv,.mp4,.m4v,.avi` | |
 | `FURIGANA` | `1` | generate `.ja.ass` |
 | `BATCH_SIZE` / `CONTEXT_CUES` | `60` / `8` | |
-| `MAX_RETRIES` / `MIN_INTERVAL_S` | `6` / `1.0` | per model / seconds between requests |
+| `MAX_RETRIES` / `MIN_INTERVAL_S` | `6` / `1.0` | per model / minimum seconds between two requests (all workers) |
+| `MAX_RPM` | `0` | global requests/minute cap shared by all workers (`0` = `MIN_INTERVAL_S` only) |
+| `WORKERS` | `1` | videos processed in parallel during a scan |
+| `PARALLEL_LANGS` | `1` | translate the target languages of a video concurrently |
 | `MAX_BACKOFF_S` | `300` | longest wait between retries |
 | `HTTP_TIMEOUT_S` | `180` | raise it for slow "thinking" models |
 | `LIBRARY_PATHS` | `/media` | `:`-separated |

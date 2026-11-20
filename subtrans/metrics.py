@@ -21,6 +21,7 @@ HELP = {
     "jimaku_files_written_total": ("counter", "Subtitle files written, by kind (srt language / ass)"),
     "jimaku_scan_last_success_timestamp_seconds": ("gauge", "End of the last completed scan"),
     "jimaku_scan_duration_seconds": ("gauge", "Duration of the last scan"),
+    "jimaku_active_tasks": ("gauge", "Videos being processed right now"),
     "jimaku_videos": ("gauge", "Videos by last outcome (state, reason)"),
 }
 
@@ -29,6 +30,12 @@ def inc(name, value=1.0, **labels):
     key = (name, tuple(sorted(labels.items())))
     with _lock:
         _counters[key] = _counters.get(key, 0.0) + value
+
+
+def inc_gauge(name, delta, **labels):
+    key = (name, tuple(sorted(labels.items())))
+    with _lock:
+        _gauges[key] = _gauges.get(key, 0.0) + delta
 
 
 def set_gauge(name, value, **labels):
