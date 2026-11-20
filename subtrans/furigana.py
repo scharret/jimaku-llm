@@ -1,4 +1,5 @@
 """Japanese SRT -> ASS with furigana positioned (\\pos) above each kanji."""
+import re
 import unicodedata
 
 import fugashi
@@ -98,6 +99,28 @@ def ruby_segments(line):
         if b:
             segs.append((s[len(s) - b:], None))
     return segs
+
+
+_SDH_BRACKETS = re.compile(r"[\[［【〔][^\]］】〕]*[\]］】〕]|[(（][^)）]*[)）]")
+_SDH_MARKS = re.compile(r"[♪♫≪≫〈〉＜＞→➡]")
+
+
+def strip_sdh(text):
+    """Remove hearing-impaired annotations: [sound], （sigh）, （Name）speaker tags, ♪ music marks, ≪off-screen≫."""
+    out = []
+    for line in text.split("\n"):
+        line = _SDH_MARKS.sub("", _SDH_BRACKETS.sub("", line))
+        line = line.strip(" 　～〜~-－")
+        if line:
+            out.append(line)
+    return "\n".join(out)
+
+
+def strip_sdh_cues(cues):
+    """Same cues without annotations; cues left empty are dropped and the rest renumbered."""
+    kept = [(tc, strip_sdh(t)) for _, tc, t in cues]
+    kept = [(tc, t) for tc, t in kept if t]
+    return [(i + 1, tc, t) for i, (tc, t) in enumerate(kept)]
 
 
 def _ts(tc):

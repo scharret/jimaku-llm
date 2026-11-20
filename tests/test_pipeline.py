@@ -506,7 +506,8 @@ def test_pgs_english_is_ocrd_then_translated(tmp_path):
 
 @needs_ffmpeg
 @needs_tesseract
-def test_pgs_japanese_uses_vision_and_is_not_translated(tmp_path):
+def test_pgs_japanese_uses_vision_and_is_not_translated(tmp_path, monkeypatch):
+    monkeypatch.setitem(m.CFG, "furigana_strip_sdh", False)  # the dummy OCR text is "[vision ...]"
     d = film_dir(tmp_path)
     video = mux_pgs(tmp_path, d / "Film.mkv", "jpn", [(encode_pgs(PGS_SUBS, LATIN_FONT), "eng"),
                                                      (encode_pgs(PGS_SUBS, LATIN_FONT), "jpn")])
@@ -514,3 +515,29 @@ def test_pgs_japanese_uses_vision_and_is_not_translated(tmp_path):
     assert not (d / "Film.ja.srt").exists()            # Japanese PGS exists: not translated
     ass = (d / "Film.ja.ass").read_text(encoding="utf-8-sig")
     assert "[vision a] 1" in ass                       # furigana built from the OCR'd Japanese (vision engine)
+
+
+def test_full_title_overrides_forced_flag():
+    from subtrans.embedded import available_sub_langs, pick_text_track
+    mislabelled = {"index": 3, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle",
+                   "tags": {"language": "fre", "title": "Français Complets PGS"},
+                   "disposition": {"forced": 1, "default": 1}}
+    really_forced = {"index": 4, "codec_type": "subtitle", "codec_name": "subrip",
+                     "tags": {"language": "jpn", "title": "Forcés"}, "disposition": {"forced": 1}}
+    assert available_sub_langs([mislabelled, really_forced]) == {"fr"}
+    full_text = dict(mislabelled, codec_name="subrip")
+    assert pick_text_track([full_text], "fr")["index"] == 3
+
+
+def test_furigana_strips_sdh(tmp_path):
+    d = film_dir(tmp_path)
+    (d / "Film.ja.hi.srt").write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n［銃声］\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n（男）家に帰った。\n\n", encoding="utf-8")
+    (d / "Film.en.srt").write_text(SRT, encoding="utf-8")
+    assert m.handle(d / "Film.en.srt", cache()) is True
+    ass = (d / "Film.ja.ass").read_text(encoding="utf-8-sig")
+    text = "".join(t for _, t in ass_events(ass, "Base"))
+    assert "銃声" not in ass and "（男）" not in ass and text == "家に帰った。"
+    starts = {line.split(",")[1] for line in ass.splitlines() if line.startswith("Dialogue: 0,")}
+    assert starts == {"0:00:03.00"}   # the sound-only cue was dropped
