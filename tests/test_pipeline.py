@@ -481,3 +481,10 @@ def test_pgs_japanese_uses_vision_and_is_not_translated(tmp_path):
     ass = (d / "Film.ja.ass").read_text(encoding="utf-8-sig")
     assert "[vision a] 1" in ass                       # furigana built from the OCR'd Japanese (vision engine)
     assert (d / "Film.fr.srt").exists()                # French still translated (from OCR'd English)
+    assert (d / "Film.fr.srt").exists()                # French still translated (from OCR'd English)
+
+
+def test_vision_prompt_ignores_furigana_for_japanese():
+    from subtrans.ocr import vision_prompt
+    assert "furigana" in vision_prompt("ja")
+    assert "furigana" not in vision_prompt("fr")
