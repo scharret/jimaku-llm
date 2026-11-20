@@ -198,9 +198,11 @@ def ocr_vision(images, lang, call_vision, batch=20):
 def vision_prompt(lang):
     from .main import LANG_NAMES
     name = LANG_NAMES.get(lang, lang)
+    ruby = ("Some kanji have small furigana (ruby) printed above them: do NOT transcribe the "
+            "furigana, only the main-size text, keeping each kanji as written. " if lang == "ja" else "")
     return (f"Each image is one subtitle from a film, in {name}. Transcribe the text exactly "
-            "(no translation, no description). Keep line breaks as \\n. Output ONLY a JSON object "
-            "{id: text} with the ids given before each image; use \"\" for an image without text.")
+            "(no translation, no description). " + ruby + "Keep line breaks as \\n. Output ONLY a JSON "
+            "object {id: text} with the ids given before each image; use \"\" for an image without text.")
 
 
 def images_key(items):
