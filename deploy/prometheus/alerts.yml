@@ -27,3 +27,9 @@ groups:
         annotations:
           summary: "Some videos were skipped because their source has more than MAX_CUES cues"
           description: "List them with: subtrans report --reason too_many_cues"
+      - alert: JimakuDailyBudgetAlmostSpent
+        expr: jimaku_budget_spent_today_usd > 0.8
+        labels: { severity: warning }
+        annotations:
+          summary: "jimaku-llm spent more than 0.80 USD today (estimate)"
+          description: "Adjust the threshold to your DAILY_BUDGET_USD. Check: subtrans usage"
