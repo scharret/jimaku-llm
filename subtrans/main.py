@@ -901,23 +901,31 @@ def report(cache, a):
     return 0
 
 
-def main(argv=None):
+def build_parser():
     ap = argparse.ArgumentParser(prog="subtrans")
     ap.add_argument("-v", "--verbose", action="store_true")
+    # Also accept -v after the subcommand (`subtrans file X.mkv -v`, as in `docker compose run ... file X -v`).
+    # SUPPRESS: a subcommand without -v must not reset a -v given before it.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    f = sub.add_parser("file", help="process one video file or one subtitle file")
+    f = sub.add_parser("file", parents=[common], help="process one video file or one subtitle file")
     f.add_argument("path")
     f.add_argument("--force", action="store_true")
-    s = sub.add_parser("scan", help="walk LIBRARY_PATHS for video files")
+    s = sub.add_parser("scan", parents=[common], help="walk LIBRARY_PATHS for video files")
     s.add_argument("--watch", type=int, default=0, help="rescan every N seconds")
     s.add_argument("--force", action="store_true")
-    r = sub.add_parser("report", help="show the last outcome of every video (skipped/failed/done)")
+    r = sub.add_parser("report", parents=[common], help="show the last outcome of every video (skipped/failed/done)")
     r.add_argument("--state", choices=["done", "skipped", "failed"])
     r.add_argument("--reason", help="e.g. too_many_cues, no_source, image_subs_only, audio_language")
     r.add_argument("--all", action="store_true", help="include done and audio_language rows")
     r.add_argument("--json", action="store_true")
-    sub.add_parser("usage", help="estimated LLM spend per day and model (last 7 days)")
-    a = ap.parse_args(argv)
+    sub.add_parser("usage", parents=[common], help="estimated LLM spend per day and model (last 7 days)")
+    return ap
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     if a.cmd == "report":
