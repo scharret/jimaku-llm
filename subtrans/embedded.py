@@ -9,7 +9,9 @@ log = logging.getLogger("subtrans")
 
 TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
 IMAGE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
-SKIP_TITLE_WORDS = ("sign", "song", "forced", "karaoke", "commentary")
+SKIP_TITLE_WORDS = ("sign", "song", "forced", "forcé", "karaoke", "commentary")
+# A title that explicitly says "full" wins over a (frequently wrong) forced flag, e.g. "Français Complets".
+FULL_TITLE_WORDS = ("complet", "full", "intégra", "integra", "entier")
 
 # ISO 639-1 / 639-2 (B and T) codes and common names, all lowercase.
 LANG_ALIASES = {
@@ -60,6 +62,20 @@ def _disp(s):
     return s.get("disposition", {}) or {}
 
 
+def _is_forced(s):
+    title = (_tags(s).get("title") or "").lower()
+    if any(w in title for w in FULL_TITLE_WORDS):
+        return False
+    return bool(_disp(s).get("forced"))
+
+
+def _skip_title(s):
+    title = (_tags(s).get("title") or "").lower()
+    if any(w in title for w in FULL_TITLE_WORDS):
+        return False
+    return any(w in title for w in SKIP_TITLE_WORDS)
+
+
 def stream_lang(s):
     return normalize(_tags(s).get("language"))
 
@@ -72,8 +88,7 @@ def full_text_sub_langs(streams):
     """Languages that already have a complete (non-forced, text) subtitle track in the container."""
     return {stream_lang(s) for s in streams
             if s.get("codec_type") == "subtitle" and s.get("codec_name") in TEXT_CODECS
-            and not _disp(s).get("forced")
-            and not any(w in (_tags(s).get("title") or "").lower() for w in SKIP_TITLE_WORDS)}
+            and not _is_forced(s) and not _skip_title(s)}
 
 
 def available_sub_langs(streams):
@@ -81,8 +96,7 @@ def available_sub_langs(streams):
     return full_text_sub_langs(streams) | {
         stream_lang(s) for s in streams
         if s.get("codec_type") == "subtitle" and s.get("codec_name") in IMAGE_CODECS
-        and not _disp(s).get("forced")
-        and not any(w in (_tags(s).get("title") or "").lower() for w in SKIP_TITLE_WORDS)}
+        and not _is_forced(s) and not _skip_title(s)}
 
 
 def pick_text_track(streams, lang):
@@ -96,8 +110,7 @@ def pick_text_track(streams, lang):
             log.info("only image-based %s subs (PGS/VobSub): OCR not supported, skipping", lang)
         return None
     usable = [s for s in text
-              if not _disp(s).get("forced")
-              and not any(w in (_tags(s).get("title") or "").lower() for w in SKIP_TITLE_WORDS)]
+              if not _is_forced(s) and not _skip_title(s)]
     if not usable:
         return None
     usable.sort(key=lambda s: (
