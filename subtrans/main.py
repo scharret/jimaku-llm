@@ -50,6 +50,13 @@ def env(name, default=None, cast=str):
 CFG = dict(
     backend=env("BACKEND", "gemini"),                 # gemini | openai | anthropic | dummy
     models=[m.strip() for m in env("MODELS", "gemini-3.8-flash").split(",") if m.strip()],
+    # Per target language overrides: MODELS_JA=gemini-3.8-flash, MODELS_FR=gemini-3.5-flash-lite...
+    models_by_lang={k[len("MODELS_"):].lower(): [m.strip() for m in v.split(",") if m.strip()]
+                    for k, v in os.environ.items() if k.startswith("MODELS_") and v.strip()},
+    ocr_models=[m.strip() for m in env("OCR_MODELS", "").split(",") if m.strip()],
+    # Gemini 3 reasoning effort: auto (low, except *-lite models which keep their minimal default),
+    # none (don't send the parameter), or minimal / low / medium / high for every model.
+    thinking_level=env("THINKING_LEVEL", "auto").lower(),
     api_key=env("API_KEY", ""),
     openai_base=env("OPENAI_BASE_URL", "http://ollama:11434/v1"),
     targets=[t.strip() for t in env("TARGET_LANGS", "fr,ja").split(",") if t.strip()],
@@ -229,6 +236,24 @@ def _post(url, headers, body):
     return r.json()
 
 
+def models_for(lang):
+    return CFG["models_by_lang"].get(lang) or CFG["models"]
+
+
+def ocr_models_for(lang):
+    return CFG["ocr_models"] or models_for(lang)
+
+
+def gemini_config(model, temperature):
+    cfg = {"temperature": temperature, "responseMimeType": "application/json"}
+    level = CFG["thinking_level"]
+    if level == "auto":
+        level = "" if "lite" in model else "low"
+    if level and level != "none":
+        cfg["thinkingConfig"] = {"thinkingLevel": level}
+    return cfg
+
+
 def _tokens(model, inp, out):
     if inp:
         metrics.inc("jimaku_llm_tokens_total", inp, model=model, kind="input")
@@ -244,7 +269,7 @@ def call_llm(model, system, user):
             {"x-goog-api-key": CFG["api_key"], "Content-Type": "application/json"},
             {"systemInstruction": {"parts": [{"text": system}]},
              "contents": [{"role": "user", "parts": [{"text": user}]}],
-             "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"}})
+             "generationConfig": gemini_config(model, 0.3)})
         u = data.get("usageMetadata") or {}
         _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"))
         try:
@@ -286,7 +311,7 @@ def call_vision(model, prompt, items):
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             {"x-goog-api-key": CFG["api_key"], "Content-Type": "application/json"},
             {"contents": [{"role": "user", "parts": parts}],
-             "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"}})
+             "generationConfig": gemini_config(model, 0.0)})
         u = data.get("usageMetadata") or {}
         _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"))
         try:
@@ -332,7 +357,7 @@ def vision_batch(lang, items, cache):
         return hit
     ids = {k for k, _ in items}
     last_err = None
-    for model in CFG["models"]:
+    for model in ocr_models_for(lang):
         if model in _dead_models:
             continue
         for attempt in range(CFG["max_retries"]):
@@ -413,7 +438,8 @@ def translate_batch(batch, ctx, lang, glossary, cache, src_lang="en"):
             + "\n".join(f"{s} => {t}" for s, t in ctx)
             + "\n\nTRANSLATE:\n" + json.dumps(src, ensure_ascii=False))
     last_err = None
-    for model in CFG["models"]:
+    models = models_for(lang)
+    for model in models:
         if model in _dead_models:
             continue
         for attempt in range(CFG["max_retries"]):
@@ -459,8 +485,8 @@ def translate_batch(batch, ctx, lang, glossary, cache, src_lang="en"):
                 time.sleep(delay)
         if model not in _dead_models:
             log.warning("giving up on %s for batch %s-%s", model, batch[0][0], batch[-1][0])
-    if all(m in _dead_models for m in CFG["models"]):
-        raise RuntimeError(f"no usable model in MODELS={CFG['models']}: {last_err}")
+    if all(m in _dead_models for m in models):
+        raise RuntimeError(f"no usable model for {lang} (MODELS{'_' + lang.upper() if lang in CFG['models_by_lang'] else ''}={models}): {last_err}")
     if isinstance(last_err, Overloaded):
         # Capacity/quota problem: splitting the batch would only multiply requests. Stop and resume later.
         _stop.set()

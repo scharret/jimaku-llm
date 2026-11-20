@@ -8,7 +8,9 @@ services:
     env_file: .env               # API_KEY lives here, never in the compose file
     environment:
       BACKEND: gemini
-      MODELS: gemini-3.8-flash,gemini-3.5-flash-lite   # fallback order
+      MODELS: gemini-3.5-flash-lite,gemini-3.8-flash      # fallback order (default / French)
+      MODELS_JA: gemini-3.8-flash,gemini-3.5-flash-lite   # Japanese: quality first
+      OCR_MODELS: gemini-3.8-flash
       TARGET_LANGS: fr,ja
       REQUIRE_AUDIO_LANGS: ja      # only Japanese-audio videos
       FURIGANA: "1"

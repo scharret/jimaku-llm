@@ -99,6 +99,21 @@ The Kubernetes CronJob runs one-shot scans and does not expose metrics.
 Counters reset on restart (use `increase()`/`rate()`). Scrape config and alert rules
 (stale scan, quota exhausted, high failure ratio, skipped files) are in [`deploy/prometheus/`](deploy/prometheus/).
 
+## Choosing models
+
+Quality matters most where you learn from the output. A sensible split on Gemini:
+
+```yaml
+MODELS: gemini-3.5-flash-lite,gemini-3.8-flash      # default (French): cheap and fast
+MODELS_JA: gemini-3.8-flash,gemini-3.5-flash-lite   # Japanese: better quality for study
+OCR_MODELS: gemini-3.8-flash                        # reading kanji from images
+THINKING_LEVEL: auto
+```
+
+Reasoning models default to a high/medium thinking level: slow (minutes per batch) and billed as output
+tokens. Subtitle translation needs little reasoning, hence `THINKING_LEVEL=auto` (`low`). Check the real cost
+with `jimaku_llm_tokens_total`.
+
 ## Parallelism
 
 Batches of one video stay sequential (each batch gets the previous translations as context, which keeps
@@ -160,6 +175,9 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `BACKEND` | `gemini` | `gemini` \| `anthropic` \| `openai` \| `dummy` (offline tests) |
 | `API_KEY` | — | not needed for a local OpenAI-compatible server |
 | `MODELS` | `gemini-3.8-flash` | comma-separated, tried in order |
+| `MODELS_<LANG>` | — | per target language override, e.g. `MODELS_JA=gemini-3.8-flash`, `MODELS_FR=gemini-3.5-flash-lite` |
+| `OCR_MODELS` | — | vision models for OCR (default: the target language's models) |
+| `THINKING_LEVEL` | `auto` | Gemini 3 reasoning effort: `auto` (= `low`, `*-lite` models keep their default), `none`, `minimal`, `low`, `medium`, `high` |
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
 | `OCR` | `1` | OCR image-based PGS tracks |

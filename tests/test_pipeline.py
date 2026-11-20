@@ -574,3 +574,54 @@ def test_rate_limiter_spacing(monkeypatch):
     stamps.sort()
     assert stamps[-1] - t0 >= 0.45                      # 6 requests need >= 5 intervals
     assert all(b - a >= 0.08 for a, b in zip(stamps, stamps[1:]))
+
+
+# ---------------------------------------------------------------- model selection
+def test_models_per_language(tmp_path, monkeypatch):
+    monkeypatch.setitem(m.CFG, "models_by_lang", {"ja": ["jbig"]})
+    d = film_dir(tmp_path)
+    (d / "Film.en.srt").write_text(SRT, encoding="utf-8")
+    assert m.handle(d / "Film.en.srt", cache()) is True
+    assert m.parse_srt(d / "Film.fr.srt")[0][2].startswith("[a] ")     # default MODELS
+    assert m.parse_srt(d / "Film.ja.srt")[0][2].startswith("[jbig] ")  # MODELS_JA
+    assert m.ocr_models_for("ja") == ["jbig"]
+    monkeypatch.setitem(m.CFG, "ocr_models", ["vis"])
+    assert m.ocr_models_for("ja") == ["vis"]
+
+
+def test_models_by_lang_from_env(monkeypatch):
+    import importlib
+    monkeypatch.setenv("MODELS_JA", "gemini-3.8-flash, x")
+    monkeypatch.setenv("MODELS_FR", "gemini-3.5-flash-lite")
+    cfg = importlib.reload(m).CFG
+    try:
+        assert cfg["models_by_lang"] == {"ja": ["gemini-3.8-flash", "x"], "fr": ["gemini-3.5-flash-lite"]}
+    finally:
+        monkeypatch.delenv("MODELS_JA")
+        monkeypatch.delenv("MODELS_FR")
+        importlib.reload(m)
+
+
+def test_gemini_thinking_level(monkeypatch):
+    monkeypatch.setitem(m.CFG, "thinking_level", "auto")
+    assert m.gemini_config("gemini-3.8-flash", 0.3)["thinkingConfig"] == {"thinkingLevel": "low"}
+    assert "thinkingConfig" not in m.gemini_config("gemini-3.5-flash-lite", 0.3)
+    monkeypatch.setitem(m.CFG, "thinking_level", "none")
+    assert "thinkingConfig" not in m.gemini_config("gemini-3.8-flash", 0.3)
+    monkeypatch.setitem(m.CFG, "thinking_level", "medium")
+    assert m.gemini_config("gemini-3.5-flash-lite", 0.0)["thinkingConfig"] == {"thinkingLevel": "medium"}
+
+
+def test_gemini_request_carries_thinking_level(monkeypatch):
+    sent = {}
+
+    def fake_post(url, headers, body):
+        sent.update(url=url, body=body)
+        return {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
+
+    monkeypatch.setitem(m.CFG, "backend", "gemini")
+    monkeypatch.setitem(m.CFG, "thinking_level", "auto")
+    monkeypatch.setattr(m, "_post", fake_post)
+    m.call_llm("gemini-3.8-flash", "sys", "user")
+    assert sent["url"].endswith("/gemini-3.8-flash:generateContent")
+    assert sent["body"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
