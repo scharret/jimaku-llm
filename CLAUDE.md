@@ -66,4 +66,4 @@ Tests force `BACKEND=dummy`: they must **never** call a real API. Tests needing 
 - On an existing PR: push fixes to that PR's branch, do not open a new PR.
 - Run `pytest -q` before pushing and say in your comment which tests were skipped.
 - **Never merge**, never approve, never change branch protection or secrets: the owner reviews and merges.
-- Reply to the owner in French; keep code and PR text in English.
+- Reply to the owner in English; keep code and PR text in English.
