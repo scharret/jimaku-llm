@@ -42,8 +42,12 @@ def text_image(text, font_path, size=48):
     return img
 
 
-def encode(subs, font_path, screen=(1920, 1080)):
-    """subs: [(start_s, end_s, text)] -> .sup bytes."""
+def encode(subs, font_path, screen=(1920, 1080), repeats=0):
+    """subs: [(start_s, end_s, text)] -> .sup bytes.
+
+    repeats: re-send each subtitle N extra times (acquisition points, like real Blu-rays do),
+    the first one with a transparent palette (fade-in).
+    """
     out = bytearray()
     for n, (start, end, text) in enumerate(subs):
         img = text_image(text, font_path)
@@ -56,8 +60,18 @@ def encode(subs, font_path, screen=(1920, 1080)):
         pds = bytes([0, 0]) + bytes([0, 16, 128, 128, 0, 1, 235, 128, 128, 255, 2, 16, 128, 128, 255])
         rle = _rle(img)
         ods = struct.pack(">HBB", 0, 0, 0xC0) + struct.pack(">I", len(rle) + 4)[1:] + struct.pack(">HH", w, h) + rle
+        if repeats:  # fade-in: same bitmap, fully transparent palette
+            faded = bytes([0, 0]) + bytes([0, 16, 128, 128, 0, 1, 235, 128, 128, 0, 2, 16, 128, 128, 0])
+            out += _seg(start, 0x16, pcs) + _seg(start, 0x17, wds) + _seg(start, 0x14, faded)
+            out += _seg(start, 0x15, ods) + _seg(start, 0x80, b"")
+            start = start + 0.04
         out += _seg(start, 0x16, pcs) + _seg(start, 0x17, wds) + _seg(start, 0x14, pds)
         out += _seg(start, 0x15, ods) + _seg(start, 0x80, b"")
+        step = (end - start) / (repeats + 1) if repeats else 0
+        for r in range(1, repeats):  # acquisition points: identical display set re-sent
+            t = start + r * step
+            out += _seg(t, 0x16, pcs) + _seg(t, 0x17, wds) + _seg(t, 0x14, pds)
+            out += _seg(t, 0x15, ods) + _seg(t, 0x80, b"")
         clear = struct.pack(">HHBHBBBB", screen[0], screen[1], 0x10, n * 2 + 1, 0x00, 0, 0, 0)
         out += _seg(end, 0x16, clear) + _seg(end, 0x17, wds) + _seg(end, 0x80, b"")
     return bytes(out)

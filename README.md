@@ -40,7 +40,8 @@ For every video under `LIBRARY_PATHS`:
    `mkvpropedit X.mkv --edit track:a1 --set language=jpn`, or set `REQUIRE_AUDIO_LANGS=` to disable the filter.
 2. **Existing subtitles win** — a target language is skipped when subtitles already exist, either
    - next to the video, with Bazarr/Radarr naming: `X.fr.srt`, `X.fre.srt`, `X.fra.hi.srt`, `X.ja.ass`… (`*.forced.*` does not count), or
-   - embedded in the container as a full text track (not forced, not "Signs & Songs").
+   - embedded in the container as a full text or image track (not forced, not "Signs & Songs").
+     A title that explicitly says full (`Complets`, `Full`, `Intégral`) wins over a forced flag, which is often wrong.
 3. **Source subtitles** — the first language of `SOURCE_LANGS` (default `en,fr`) that is available:
    an external file (`X.en.srt`, `X.fre.srt`…), otherwise the **embedded** text track, extracted with
    `ffprobe`/`ffmpeg` (SubRip preferred over ASS, plain over SDH). **PGS** (Blu-ray image subtitles)
@@ -121,6 +122,18 @@ names and register consistent). What runs in parallel: the target languages of a
 and several videos (`WORKERS`). All workers share one rate limiter (`MAX_RPM` / `MIN_INTERVAL_S`), a 429/5xx
 puts **every** worker on cooldown, and a `ProviderBusy` stops them all. Example for a paid Gemini key:
 `WORKERS=3 MAX_RPM=60`.
+## Cost control
+
+Every response's token usage (thinking included) is priced with a built-in table (overridable with `PRICES`)
+and stored per UTC day in the cache DB. When `DAILY_BUDGET_USD` is reached, the run stops like a busy
+provider and resumes the next day; in-flight requests can overshoot by about one batch.
+
+```bash
+docker compose run --rm subtrans usage      # spend per day and model
+```
+
+Metrics: `jimaku_llm_cost_usd_total{model}`, `jimaku_budget_spent_today_usd`. These are estimates: the
+provider bill (taxes included) is the source of truth.
 
 ## Reliability
 
@@ -181,6 +194,9 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
 | `OCR` | `1` | OCR image-based PGS tracks |
+| `OCR_MEDIA_RESOLUTION` | `low` | Gemini image resolution for OCR: `low` (~280 tokens/image), `medium`, `high`, empty = API default (~1120 tokens/image on Gemini 3) |
+| `DAILY_BUDGET_USD` | `1.0` | estimated spend per UTC day; once reached, no new request until 00:00 UTC (`0` = unlimited) |
+| `PRICES` | built-in | override the price table, USD per 1M tokens: `model=in/out,model2=in/out` |
 | `OCR_VISION_LANGS` | `ja` | languages OCR'd with the vision LLM (others: Tesseract) |
 | `METRICS_PORT` | `9108` | `/metrics` in `scan --watch` mode; `0` disables |
 | `MAX_CUES` | `5000` | safety net: sources with more cues are skipped (runaway effects, broken files) |
@@ -190,6 +206,7 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `KEEP_EXTRACTED` | `0` | `1` = write the extracted `<video>.en.srt` next to the video |
 | `VIDEO_EXTS` | `.mkv,.mp4,.m4v,.avi` | |
 | `FURIGANA` | `1` | generate `.ja.ass` |
+| `FURIGANA_STRIP_SDH` | `1` | drop hearing-impaired annotations (`［銃声］`, `（ため息）`, speaker names, `♪`) from the furigana ASS |
 | `BATCH_SIZE` / `CONTEXT_CUES` | `60` / `8` | |
 | `MAX_RETRIES` / `MIN_INTERVAL_S` | `6` / `1.0` | per model / minimum seconds between two requests (all workers) |
 | `MAX_RPM` | `0` | global requests/minute cap shared by all workers (`0` = `MIN_INTERVAL_S` only) |

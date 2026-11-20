@@ -32,7 +32,7 @@ from pathlib import Path
 
 import requests
 
-from . import metrics
+from . import budget, metrics
 
 log = logging.getLogger("subtrans")
 
@@ -61,6 +61,8 @@ CFG = dict(
     openai_base=env("OPENAI_BASE_URL", "http://ollama:11434/v1"),
     targets=[t.strip() for t in env("TARGET_LANGS", "fr,ja").split(",") if t.strip()],
     furigana=env("FURIGANA", "1") == "1",
+    # Drop hearing-impaired annotations ([銃声], （ため息）, ♪, speaker names) from the furigana ASS.
+    furigana_strip_sdh=env("FURIGANA_STRIP_SDH", "1") == "1",
     batch=env("BATCH_SIZE", 60, int),
     context=env("CONTEXT_CUES", 8, int),
     max_retries=env("MAX_RETRIES", 6, int),
@@ -85,6 +87,12 @@ CFG = dict(
     metrics_port=env("METRICS_PORT", 9108, int),
     # OCR of image-based PGS (Blu-ray) subtitles: Tesseract locally, a vision LLM for OCR_VISION_LANGS.
     ocr=env("OCR", "1") == "1",
+    # Gemini media resolution for OCR images: low (~280 tokens/image), medium, high, or "" (API default,
+    # ~1120 tokens/image on Gemini 3). Subtitle strips are plain text: low is usually enough.
+    ocr_media_resolution=env("OCR_MEDIA_RESOLUTION", "low").lower(),
+    # Estimated USD per UTC day; once reached, no new LLM request is sent until tomorrow (0 = no limit).
+    daily_budget_usd=env("DAILY_BUDGET_USD", 1.0, float),
+    prices=budget.parse_prices(env("PRICES", "")),
     ocr_vision_langs=[x.strip() for x in env("OCR_VISION_LANGS", "ja").split(",") if x.strip()],   # 0 = disabled; only served in scan --watch mode
     video_exts=[e.strip().lower() for e in env("VIDEO_EXTS", ".mkv,.mp4,.m4v,.avi").split(",")],
 )
@@ -214,6 +222,7 @@ def cooldown(seconds):
 
 
 def _post(url, headers, body):
+    _check_budget()
     _throttle()
     try:
         r = requests.post(url, headers=headers, json=body, timeout=CFG["timeout"])
@@ -254,11 +263,26 @@ def gemini_config(model, temperature):
     return cfg
 
 
-def _tokens(model, inp, out):
+class BudgetExceeded(ProviderBusy):
+    """Daily budget reached: stop like a busy provider, resume tomorrow."""
+
+
+def _check_budget():
+    limit = CFG["daily_budget_usd"]
+    if limit and budget.spent_today(CFG["cache"]) >= limit:
+        raise BudgetExceeded(f"daily budget reached ({budget.spent_today(CFG['cache']):.2f} / {limit:.2f} USD, "
+                             "resets at 00:00 UTC)")
+
+
+def _tokens(model, inp, out, thoughts=0):
+    inp, out = int(inp or 0), int(out or 0) + int(thoughts or 0)  # thinking is billed as output
     if inp:
         metrics.inc("jimaku_llm_tokens_total", inp, model=model, kind="input")
     if out:
         metrics.inc("jimaku_llm_tokens_total", out, model=model, kind="output")
+    if inp or out:
+        usd = budget.record(CFG["cache"], model, inp, out, CFG["prices"])
+        metrics.inc("jimaku_llm_cost_usd_total", usd, model=model)
 
 
 def call_llm(model, system, user):
@@ -271,7 +295,7 @@ def call_llm(model, system, user):
              "contents": [{"role": "user", "parts": [{"text": user}]}],
              "generationConfig": gemini_config(model, 0.3)})
         u = data.get("usageMetadata") or {}
-        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"))
+        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"), u.get("thoughtsTokenCount"))
         try:
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError):
@@ -299,6 +323,14 @@ def call_llm(model, system, user):
     raise ValueError(f"unknown BACKEND: {b}")
 
 
+def vision_config():
+    cfg = {"temperature": 0.0, "responseMimeType": "application/json"}
+    res = CFG["ocr_media_resolution"]
+    if res in ("low", "medium", "high"):
+        cfg["mediaResolution"] = f"MEDIA_RESOLUTION_{res.upper()}"
+    return cfg
+
+
 def call_vision(model, prompt, items):
     """items: [(id, png_bytes)]. Returns the raw model text (JSON expected)."""
     from .ocr import b64
@@ -313,7 +345,7 @@ def call_vision(model, prompt, items):
             {"contents": [{"role": "user", "parts": parts}],
              "generationConfig": gemini_config(model, 0.0)})
         u = data.get("usageMetadata") or {}
-        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"))
+        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"), u.get("thoughtsTokenCount"))
         try:
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError):
@@ -350,7 +382,9 @@ def call_vision(model, prompt, items):
 def vision_batch(lang, items, cache):
     """OCR a batch of subtitle images with a vision model; same retry/fallback rules as translation."""
     from .ocr import images_key, vision_prompt
-    key = "ocr:" + images_key(items) + ":" + lang
+    prompt = vision_prompt(lang)
+    # The prompt is part of the key: improving it must not keep serving old cached transcriptions.
+    key = "ocr:" + images_key(items) + ":" + lang + ":" + hashlib.sha1(prompt.encode()).hexdigest()[:8]
     hit = cache.get(key)
     if hit:
         metrics.inc("jimaku_cache_hits_total")
@@ -363,7 +397,7 @@ def vision_batch(lang, items, cache):
         for attempt in range(CFG["max_retries"]):
             try:
                 try:
-                    out = parse_json_obj(call_vision(model, vision_prompt(lang), items))
+                    out = parse_json_obj(call_vision(model, prompt, items))
                 except json.JSONDecodeError as e:
                     raise BadOutput(f"invalid JSON: {e}") from e
                 if not isinstance(out, dict) or not set(out) <= ids:
@@ -629,13 +663,12 @@ def find_srt(lang, base: Path, video: Path | None, streams, ext, cache: Cache, e
 
 def ocr_source(lang, base: Path, video: Path, streams, cache: Cache):
     """OCR the best PGS track in `lang` into an SRT in the cache dir."""
-    from .embedded import aliases
+    from .embedded import _is_forced, _skip_title, aliases
     from .ocr import ocr_track
     codes = aliases(lang)
     pgs = [s for s in streams if s.get("codec_type") == "subtitle" and s.get("codec_name") == "hdmv_pgs_subtitle"
            and ((s.get("tags") or {}).get("language") or "").lower() in codes
-           and not (s.get("disposition") or {}).get("forced")
-           and "sign" not in ((s.get("tags") or {}).get("title") or "").lower()]
+           and not _is_forced(s) and not _skip_title(s)]
     if not pgs:
         return None
     pgs.sort(key=lambda s: (bool((s.get("disposition") or {}).get("hearing_impaired")), s["index"]))
@@ -645,8 +678,18 @@ def ocr_source(lang, base: Path, video: Path, streams, cache: Cache):
     if dest.exists() and dest.stat().st_mtime >= video.stat().st_mtime:
         return dest
     log.info("OCR of embedded %s PGS stream #%s from %s (%s)", lang, pgs[0]["index"], video.name, engine)
-    srt = ocr_track(video, pgs[0]["index"], lang, engine,
-                    call_vision=lambda lg, items: vision_batch(lg, items, cache))
+    from .ocr import TooManyImages
+    st = video.stat()
+    big_key = f"ocr_too_many:{lang}:{video}:{st.st_size}:{int(st.st_mtime)}"
+    if cache.get(big_key):
+        raise TooManyImages(cache.get(big_key))  # known: don't re-read the file every scan
+    try:
+        srt = ocr_track(video, pgs[0]["index"], lang, engine,
+                        call_vision=lambda lg, items: vision_batch(lg, items, cache),
+                        max_images=CFG["max_cues"])
+    except TooManyImages as e:
+        cache.put(big_key, str(e))
+        raise
     n = srt.count(" --> ")
     metrics.inc("jimaku_ocr_cues_total", n, lang=lang, engine=engine)
     if not n:
@@ -766,7 +809,11 @@ def handle(path: Path, cache, force=False):
             ja_src = find_srt("ja", base, video, streams, ext, cache)
             if ja_src:
                 from .furigana import cues_to_ass
-                write_atomic(ass, cues_to_ass(parse_srt(ja_src), title=base.name), encoding="utf-8-sig")
+                cues = parse_srt(ja_src)
+                if CFG["furigana_strip_sdh"]:
+                    from .furigana import strip_sdh_cues
+                    cues = strip_sdh_cues(cues)
+                write_atomic(ass, cues_to_ass(cues, title=base.name), encoding="utf-8-sig")
                 log.info("wrote %s (from %s)", ass.name,
                          "embedded track" if ja_src.parent != base.parent else ja_src.name)
                 written.append("ja.ass")
@@ -869,11 +916,19 @@ def main(argv=None):
     r.add_argument("--reason", help="e.g. too_many_cues, no_source, image_subs_only, audio_language")
     r.add_argument("--all", action="store_true", help="include done and audio_language rows")
     r.add_argument("--json", action="store_true")
+    sub.add_parser("usage", help="estimated LLM spend per day and model (last 7 days)")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     if a.cmd == "report":
         return report(Cache(CFG["cache"]), a)
+    if a.cmd == "usage":
+        Cache(CFG["cache"])  # make sure the DB exists
+        print(f"today ({budget.today()} UTC): {budget.spent_today(CFG['cache']):.3f} USD"
+              f" / budget {CFG['daily_budget_usd'] or 'unlimited'}")
+        for day, model, inp, out, usd in budget.summary(CFG["cache"]):
+            print(f"{day}  {model:<28} in={inp:>10,} out={out:>9,}  {usd:7.3f} USD")
+        return 0
     if CFG["backend"] not in ("dummy", "openai") and not CFG["api_key"]:
         sys.exit("API_KEY is missing")
     cache = Cache(CFG["cache"])

@@ -15,6 +15,8 @@ HELP = {
     "jimaku_llm_requests_total": ("counter", "LLM requests by model and outcome"),
     "jimaku_llm_request_seconds_total": ("counter", "Time spent waiting for the LLM"),
     "jimaku_llm_tokens_total": ("counter", "Tokens reported by the provider, by model and kind (input/output)"),
+    "jimaku_llm_cost_usd_total": ("counter", "Estimated LLM cost (USD) from provider-reported tokens and the price table"),
+    "jimaku_budget_spent_today_usd": ("gauge", "Estimated spend of the current UTC day (persisted)"),
     "jimaku_cache_hits_total": ("counter", "Translated batches served from the cache"),
     "jimaku_cues_translated_total": ("counter", "Subtitle cues translated, by target language"),
     "jimaku_ocr_cues_total": ("counter", "Subtitle cues recognised by OCR, by language and engine"),
@@ -57,6 +59,12 @@ def render(cache=None):
             for state, reason, n in cache.db.execute(
                     "SELECT state, reason, COUNT(*) FROM status GROUP BY state, reason"):
                 items.append((("jimaku_videos", (("reason", reason), ("state", state))), float(n)))
+        except Exception:
+            pass
+        try:
+            row = cache.db.execute("SELECT COALESCE(SUM(usd), 0) FROM usage WHERE day=?",
+                                   (time.strftime("%Y-%m-%d", time.gmtime()),)).fetchone()
+            items.append((("jimaku_budget_spent_today_usd", ()), float(row[0])))
         except Exception:
             pass
     lines, seen = [], set()

@@ -107,10 +107,32 @@ def parse_sup(data):
             ds = None
     if shown:
         out.append((shown[0], shown[0] + 5, shown[1], shown[2]))
-    for start, end, objs, pal in out:
+    for start, end, objs, pal in merge_repeats(out):
         if end - start < 0.05:
             continue
         yield start, end, [(ox, oy, w, h, _rle_decode(rle, w, h), pal) for ox, oy, w, h, rle in objs]
+
+
+def _opacity(pal):
+    return sum(a for _, a in pal.values())
+
+
+def merge_repeats(sets, gap=0.25):
+    """Blu-ray PGS re-sends the same bitmap many times (acquisition points, palette-only fades).
+
+    Consecutive display sets with identical bitmaps are one subtitle: merge them, keeping the most
+    opaque palette (a fade-in starts transparent, which would hide the text from OCR).
+    """
+    merged = []
+    for start, end, objs, pal in sets:
+        prev = merged[-1] if merged else None
+        if prev and prev[2] == objs and start - prev[1] <= gap:
+            prev[1] = max(prev[1], end)
+            if _opacity(pal) > _opacity(prev[3]):
+                prev[3] = pal
+            continue
+        merged.append([start, end, objs, pal])
+    return merged
 
 
 def render(objs, pad=12):
@@ -176,9 +198,11 @@ def ocr_vision(images, lang, call_vision, batch=20):
 def vision_prompt(lang):
     from .main import LANG_NAMES
     name = LANG_NAMES.get(lang, lang)
+    ruby = ("Some kanji have small furigana (ruby) printed above them: do NOT transcribe the "
+            "furigana, only the main-size text, keeping each kanji as written. " if lang == "ja" else "")
     return (f"Each image is one subtitle from a film, in {name}. Transcribe the text exactly "
-            "(no translation, no description). Keep line breaks as \\n. Output ONLY a JSON object "
-            "{id: text} with the ids given before each image; use \"\" for an image without text.")
+            "(no translation, no description). " + ruby + "Keep line breaks as \\n. Output ONLY a JSON "
+            "object {id: text} with the ids given before each image; use \"\" for an image without text.")
 
 
 def images_key(items):
@@ -194,7 +218,11 @@ def b64(png):
 
 
 # ---------------------------------------------------------------- entry point
-def ocr_track(video: Path, track_index, lang, engine, call_vision=None):
+class TooManyImages(Exception):
+    pass
+
+
+def ocr_track(video: Path, track_index, lang, engine, call_vision=None, max_images=None):
     """OCR an embedded PGS track. Returns SRT text, or '' if nothing was recognised."""
     with tempfile.TemporaryDirectory() as tmp:
         sup = Path(tmp) / "track.sup"
@@ -204,6 +232,9 @@ def ocr_track(video: Path, track_index, lang, engine, call_vision=None):
         sets = list(parse_sup(sup.read_bytes()))
     if not sets:
         return ""
+    if max_images and len(sets) > max_images:
+        # Same safety net as MAX_CUES for text sources: never send thousands of images to a paid API.
+        raise TooManyImages(f"{len(sets)} subtitle images > MAX_CUES={max_images}")
     images = [render(objs) for _, _, objs in sets]
     log.info("OCR %s: %d subtitle images with %s", lang, len(images), engine)
     if engine == "vision":
