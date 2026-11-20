@@ -185,6 +185,39 @@ def test_furigana_okurigana():
     assert ("何", "なん") in ruby_segments("何度も")
 
 
+def ass_events(ass, style):
+    """[(x, text)] of the Dialogue events of one style."""
+    import re
+    out = []
+    for line in ass.splitlines():
+        if line.startswith("Dialogue:") and line.split(",")[3] == style:
+            text = line.split(",", 9)[9]
+            out.append((int(re.search(r"\\pos\((\d+),", text)[1]), re.sub(r"\{[^}]*\}", "", text)))
+    return out
+
+
+def test_furigana_keeps_spaces():
+    from subtrans.furigana import ruby_segments
+    line = "〈風見〉 それも 事情聴取で伺います"
+    assert "".join(s for s, _ in ruby_segments(line)) == line
+
+
+def test_furigana_ruby_centred_on_its_kanji():
+    # Regression: widths assumed 1 kanji = Fontsize, but libass renders Noto Sans CJK JP
+    # at Fontsize / 1.448 per kanji, so the ruby drifted away from its kanji.
+    from subtrans.furigana import EM_RATIO, FS, X0, _width, cues_to_ass
+    line = "〈風見) それも 事情聴取で 伺います"
+    ass = cues_to_ass([(1, "00:00:01,000 --> 00:00:02,000", line)])
+    base, ruby = dict((t, x) for x, t in ass_events(ass, "Base")), ass_events(ass, "Ruby")
+    assert [r for _, r in ruby] == ["かざみ", "じじょう", "ちょうしゅ", "うかが"]
+    em = FS * EM_RATIO
+    for (x, _), kanji in zip(ruby, ["風見", "事情", "聴取", "伺"]):
+        assert abs(base[kanji] + len(kanji) * em / 2 - x) <= 1   # ruby centred on its own word
+    assert "".join(t for _, t in ass_events(ass, "Base")).replace(" ", "") == line.replace(" ", "")
+    width = sum(_width(c) for c in line) * em
+    assert abs(min(base.values()) - (X0 - width / 2)) <= 1         # line centred on its real width
+
+
 # ---------------------------------------------------------------- with ffmpeg
 
 @needs_ffmpeg
@@ -224,7 +257,8 @@ def test_embedded_target_languages_are_reused(tmp_path):
     assert not (d / "Film.fr.srt").exists()   # French already embedded
     assert not (d / "Film.ja.srt").exists()   # Japanese already embedded: not translated...
     ass = (d / "Film.ja.ass").read_text(encoding="utf-8-sig")
-    assert "家に帰った" in ass and "かえ" in ass  # ...but furigana built from the real Japanese track
+    text = "".join(t for _, t in ass_events(ass, "Base"))
+    assert "家に帰った" in text and "かえ" in ass  # ...but furigana built from the real Japanese track
     assert m.handle(video, cache()) is False
 
 
@@ -472,7 +506,8 @@ def test_pgs_english_is_ocrd_then_translated(tmp_path):
 
 @needs_ffmpeg
 @needs_tesseract
-def test_pgs_japanese_uses_vision_and_is_not_translated(tmp_path):
+def test_pgs_japanese_uses_vision_and_is_not_translated(tmp_path, monkeypatch):
+    monkeypatch.setitem(m.CFG, "furigana_strip_sdh", False)  # the dummy OCR text is "[vision ...]"
     d = film_dir(tmp_path)
     video = mux_pgs(tmp_path, d / "Film.mkv", "jpn", [(encode_pgs(PGS_SUBS, LATIN_FONT), "eng"),
                                                      (encode_pgs(PGS_SUBS, LATIN_FONT), "jpn")])
@@ -488,3 +523,29 @@ def test_vision_prompt_ignores_furigana_for_japanese():
     from subtrans.ocr import vision_prompt
     assert "furigana" in vision_prompt("ja")
     assert "furigana" not in vision_prompt("fr")
+
+
+def test_full_title_overrides_forced_flag():
+    from subtrans.embedded import available_sub_langs, pick_text_track
+    mislabelled = {"index": 3, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle",
+                   "tags": {"language": "fre", "title": "Français Complets PGS"},
+                   "disposition": {"forced": 1, "default": 1}}
+    really_forced = {"index": 4, "codec_type": "subtitle", "codec_name": "subrip",
+                     "tags": {"language": "jpn", "title": "Forcés"}, "disposition": {"forced": 1}}
+    assert available_sub_langs([mislabelled, really_forced]) == {"fr"}
+    full_text = dict(mislabelled, codec_name="subrip")
+    assert pick_text_track([full_text], "fr")["index"] == 3
+
+
+def test_furigana_strips_sdh(tmp_path):
+    d = film_dir(tmp_path)
+    (d / "Film.ja.hi.srt").write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n［銃声］\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n（男）家に帰った。\n\n", encoding="utf-8")
+    (d / "Film.en.srt").write_text(SRT, encoding="utf-8")
+    assert m.handle(d / "Film.en.srt", cache()) is True
+    ass = (d / "Film.ja.ass").read_text(encoding="utf-8-sig")
+    text = "".join(t for _, t in ass_events(ass, "Base"))
+    assert "銃声" not in ass and "（男）" not in ass and text == "家に帰った。"
+    starts = {line.split(",")[1] for line in ass.splitlines() if line.startswith("Dialogue: 0,")}
+    assert starts == {"0:00:03.00"}   # the sound-only cue was dropped

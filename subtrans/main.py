@@ -52,6 +52,8 @@ CFG = dict(
     openai_base=env("OPENAI_BASE_URL", "http://ollama:11434/v1"),
     targets=[t.strip() for t in env("TARGET_LANGS", "fr,ja").split(",") if t.strip()],
     furigana=env("FURIGANA", "1") == "1",
+    # Drop hearing-impaired annotations ([銃声], （ため息）, ♪, speaker names) from the furigana ASS.
+    furigana_strip_sdh=env("FURIGANA_STRIP_SDH", "1") == "1",
     batch=env("BATCH_SIZE", 60, int),
     context=env("CONTEXT_CUES", 8, int),
     max_retries=env("MAX_RETRIES", 6, int),
@@ -567,13 +569,12 @@ def find_srt(lang, base: Path, video: Path | None, streams, ext, cache: Cache, e
 
 def ocr_source(lang, base: Path, video: Path, streams, cache: Cache):
     """OCR the best PGS track in `lang` into an SRT in the cache dir."""
-    from .embedded import aliases
+    from .embedded import _is_forced, _skip_title, aliases
     from .ocr import ocr_track
     codes = aliases(lang)
     pgs = [s for s in streams if s.get("codec_type") == "subtitle" and s.get("codec_name") == "hdmv_pgs_subtitle"
            and ((s.get("tags") or {}).get("language") or "").lower() in codes
-           and not (s.get("disposition") or {}).get("forced")
-           and "sign" not in ((s.get("tags") or {}).get("title") or "").lower()]
+           and not _is_forced(s) and not _skip_title(s)]
     if not pgs:
         return None
     pgs.sort(key=lambda s: (bool((s.get("disposition") or {}).get("hearing_impaired")), s["index"]))
@@ -697,7 +698,11 @@ def handle(path: Path, cache, force=False):
             ja_src = find_srt("ja", base, video, streams, ext, cache)
             if ja_src:
                 from .furigana import cues_to_ass
-                write_atomic(ass, cues_to_ass(parse_srt(ja_src), title=base.name), encoding="utf-8-sig")
+                cues = parse_srt(ja_src)
+                if CFG["furigana_strip_sdh"]:
+                    from .furigana import strip_sdh_cues
+                    cues = strip_sdh_cues(cues)
+                write_atomic(ass, cues_to_ass(cues, title=base.name), encoding="utf-8-sig")
                 log.info("wrote %s (from %s)", ass.name,
                          "embedded track" if ja_src.parent != base.parent else ja_src.name)
                 written.append("ja.ass")

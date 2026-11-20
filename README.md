@@ -40,7 +40,8 @@ For every video under `LIBRARY_PATHS`:
    `mkvpropedit X.mkv --edit track:a1 --set language=jpn`, or set `REQUIRE_AUDIO_LANGS=` to disable the filter.
 2. **Existing subtitles win** — a target language is skipped when subtitles already exist, either
    - next to the video, with Bazarr/Radarr naming: `X.fr.srt`, `X.fre.srt`, `X.fra.hi.srt`, `X.ja.ass`… (`*.forced.*` does not count), or
-   - embedded in the container as a full text track (not forced, not "Signs & Songs").
+   - embedded in the container as a full text or image track (not forced, not "Signs & Songs").
+     A title that explicitly says full (`Complets`, `Full`, `Intégral`) wins over a forced flag, which is often wrong.
 3. **Source subtitles** — the first language of `SOURCE_LANGS` (default `en,fr`) that is available:
    an external file (`X.en.srt`, `X.fre.srt`…), otherwise the **embedded** text track, extracted with
    `ffprobe`/`ffmpeg` (SubRip preferred over ASS, plain over SDH). **PGS** (Blu-ray image subtitles)
@@ -163,6 +164,7 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `KEEP_EXTRACTED` | `0` | `1` = write the extracted `<video>.en.srt` next to the video |
 | `VIDEO_EXTS` | `.mkv,.mp4,.m4v,.avi` | |
 | `FURIGANA` | `1` | generate `.ja.ass` |
+| `FURIGANA_STRIP_SDH` | `1` | drop hearing-impaired annotations (`［銃声］`, `（ため息）`, speaker names, `♪`) from the furigana ASS |
 | `BATCH_SIZE` / `CONTEXT_CUES` | `60` / `8` | |
 | `MAX_RETRIES` / `MIN_INTERVAL_S` | `6` / `1.0` | per model / seconds between requests |
 | `MAX_BACKOFF_S` | `300` | longest wait between retries |
