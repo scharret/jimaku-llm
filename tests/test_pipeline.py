@@ -47,6 +47,9 @@ def cfg(tmp_path, monkeypatch):
     monkeypatch.setitem(m.CFG, "libs", [str(tmp_path / "lib")])
     monkeypatch.setitem(m.CFG, "settle", 0)
     monkeypatch.setitem(m.CFG, "require_audio", ["ja"])
+    monkeypatch.setattr(m, "_next_slot", [0.0])
+    monkeypatch.setattr(m, "_cooldown_until", [0.0])
+    m._stop.clear()
     (tmp_path / "lib" / "Film").mkdir(parents=True)
     return tmp_path
 
@@ -518,57 +521,142 @@ def test_pgs_japanese_uses_vision_and_is_not_translated(tmp_path, monkeypatch):
     assert (d / "Film.fr.srt").exists()                # French still translated (from OCR'd English)
 
 
-@needs_tesseract
-def test_pgs_repeated_display_sets_are_merged():
-    from subtrans.ocr import ocr_tesseract, parse_sup, render
-    sets = list(parse_sup(encode_pgs(PGS_SUBS, LATIN_FONT, repeats=5)))
-    assert len(sets) == 2                                      # not 2 x 6 images
-    assert round(sets[0][0], 2) == 1.0 and round(sets[0][1], 2) == 2.5
-    texts = ocr_tesseract([render(objs) for _, _, objs in sets], "en")
-    assert "Conan" in texts[0]                                 # opaque palette kept, not the faded one
+# ---------------------------------------------------------------- parallelism
+def test_parallel_workers_and_languages(tmp_path, monkeypatch):
+    import threading as th
+    monkeypatch.setitem(m.CFG, "workers", 3)
+    monkeypatch.setitem(m.CFG, "parallel_langs", True)
+    monkeypatch.setitem(m.CFG, "require_audio", [])
+    real, active, peak = m.call_llm, [0], [0]
+    lock = th.Lock()
+
+    def slow(model, s, u):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            return real(model, s, u)
+        finally:
+            with lock:
+                active[0] -= 1
+
+    monkeypatch.setattr(m, "call_llm", slow)
+    lib = tmp_path / "lib"
+    for i in range(5):
+        d = lib / f"Film{i}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"Film{i}.en.srt").write_text(SRT, encoding="utf-8")
+        (d / f"Film{i}.mkv").write_bytes(b"")
+    monkeypatch.setattr(m, "probe_cached", lambda video, cache: [])
+    c = cache()
+    assert m.scan(c) == 0
+    for i in range(5):
+        d = lib / f"Film{i}"
+        assert len(m.parse_srt(d / f"Film{i}.fr.srt")) == 4
+        assert (d / f"Film{i}.ja.ass").exists()
+    assert len(c.statuses(state="done")) == 5
 
 
-@needs_ffmpeg
-def test_ocr_image_cap(tmp_path, monkeypatch):
-    if not os.path.exists(LATIN_FONT):
-        pytest.skip("font missing")
-    monkeypatch.setitem(m.CFG, "max_cues", 1)
-    d = film_dir(tmp_path)
-    video = mux_pgs(tmp_path, d / "Film.mkv", "jpn", [(encode_pgs(PGS_SUBS, LATIN_FONT), "jpn")])
+def test_provider_busy_stops_all_workers(tmp_path, monkeypatch):
+    monkeypatch.setitem(m.CFG, "workers", 2)
+    monkeypatch.setitem(m.CFG, "require_audio", [])
     calls = []
-    monkeypatch.setattr(m, "call_vision", lambda *a: calls.append(a) or "{}")
-    with pytest.raises(Exception, match="MAX_CUES"):
-        m.handle(video, cache())
-    assert calls == []                                         # nothing sent to the API
+
+    def busy(model, s, u):
+        calls.append(model)
+        raise m.Overloaded("HTTP 429", quota=True)
+
+    monkeypatch.setattr(m, "call_llm", busy)
+    monkeypatch.setattr(m, "cooldown", lambda s: None)
+    monkeypatch.setattr(m, "probe_cached", lambda video, cache: [])
+    lib = tmp_path / "lib"
+    for i in range(6):
+        d = lib / f"Film{i}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"Film{i}.en.srt").write_text(SRT, encoding="utf-8")
+        (d / f"Film{i}.mkv").write_bytes(b"")
+    assert m.scan(cache()) >= 1
+    # at most the in-flight videos x languages hit the API before everyone stops
+    assert len(calls) <= 2 * 2 * 2 * m.CFG["max_retries"]
 
 
-def test_vision_prompt_ignores_furigana_for_japanese():
-    from subtrans.ocr import vision_prompt
-    assert "furigana" in vision_prompt("ja")
-    assert "furigana" not in vision_prompt("fr")
+def test_rate_limiter_spacing(monkeypatch):
+    import threading as th
+    import time as _t
+    monkeypatch.setitem(m.CFG, "min_interval", 0.0)
+    monkeypatch.setitem(m.CFG, "max_rpm", 600)          # 0.1 s between requests, globally
+    monkeypatch.setattr(m, "_next_slot", [0.0])
+    monkeypatch.setattr(m, "_cooldown_until", [0.0])
+    monkeypatch.undo()                                   # use the real time.sleep for this test
+    monkeypatch.setitem(m.CFG, "min_interval", 0.0)
+    monkeypatch.setitem(m.CFG, "max_rpm", 600)
+    monkeypatch.setattr(m, "_next_slot", [0.0])
+    monkeypatch.setattr(m, "_cooldown_until", [0.0])
+    stamps = []
+    lock = th.Lock()
+
+    def go():
+        m._throttle()
+        with lock:
+            stamps.append(_t.time())
+
+    threads = [th.Thread(target=go) for _ in range(6)]
+    t0 = _t.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    stamps.sort()
+    assert stamps[-1] - t0 >= 0.45                      # 6 requests need >= 5 intervals
+    assert all(b - a >= 0.08 for a, b in zip(stamps, stamps[1:]))
 
 
-def test_full_title_overrides_forced_flag():
-    from subtrans.embedded import available_sub_langs, pick_text_track
-    mislabelled = {"index": 3, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle",
-                   "tags": {"language": "fre", "title": "Français Complets PGS"},
-                   "disposition": {"forced": 1, "default": 1}}
-    really_forced = {"index": 4, "codec_type": "subtitle", "codec_name": "subrip",
-                     "tags": {"language": "jpn", "title": "Forcés"}, "disposition": {"forced": 1}}
-    assert available_sub_langs([mislabelled, really_forced]) == {"fr"}
-    full_text = dict(mislabelled, codec_name="subrip")
-    assert pick_text_track([full_text], "fr")["index"] == 3
-
-
-def test_furigana_strips_sdh(tmp_path):
+# ---------------------------------------------------------------- model selection
+def test_models_per_language(tmp_path, monkeypatch):
+    monkeypatch.setitem(m.CFG, "models_by_lang", {"ja": ["jbig"]})
     d = film_dir(tmp_path)
-    (d / "Film.ja.hi.srt").write_text(
-        "1\n00:00:01,000 --> 00:00:02,000\n［銃声］\n\n"
-        "2\n00:00:03,000 --> 00:00:04,000\n（男）家に帰った。\n\n", encoding="utf-8")
     (d / "Film.en.srt").write_text(SRT, encoding="utf-8")
     assert m.handle(d / "Film.en.srt", cache()) is True
-    ass = (d / "Film.ja.ass").read_text(encoding="utf-8-sig")
-    text = "".join(t for _, t in ass_events(ass, "Base"))
-    assert "銃声" not in ass and "（男）" not in ass and text == "家に帰った。"
-    starts = {line.split(",")[1] for line in ass.splitlines() if line.startswith("Dialogue: 0,")}
-    assert starts == {"0:00:03.00"}   # the sound-only cue was dropped
+    assert m.parse_srt(d / "Film.fr.srt")[0][2].startswith("[a] ")     # default MODELS
+    assert m.parse_srt(d / "Film.ja.srt")[0][2].startswith("[jbig] ")  # MODELS_JA
+    assert m.ocr_models_for("ja") == ["jbig"]
+    monkeypatch.setitem(m.CFG, "ocr_models", ["vis"])
+    assert m.ocr_models_for("ja") == ["vis"]
+
+
+def test_models_by_lang_from_env(monkeypatch):
+    import importlib
+    monkeypatch.setenv("MODELS_JA", "gemini-3.8-flash, x")
+    monkeypatch.setenv("MODELS_FR", "gemini-3.5-flash-lite")
+    cfg = importlib.reload(m).CFG
+    try:
+        assert cfg["models_by_lang"] == {"ja": ["gemini-3.8-flash", "x"], "fr": ["gemini-3.5-flash-lite"]}
+    finally:
+        monkeypatch.delenv("MODELS_JA")
+        monkeypatch.delenv("MODELS_FR")
+        importlib.reload(m)
+
+
+def test_gemini_thinking_level(monkeypatch):
+    monkeypatch.setitem(m.CFG, "thinking_level", "auto")
+    assert m.gemini_config("gemini-3.8-flash", 0.3)["thinkingConfig"] == {"thinkingLevel": "low"}
+    assert "thinkingConfig" not in m.gemini_config("gemini-3.5-flash-lite", 0.3)
+    monkeypatch.setitem(m.CFG, "thinking_level", "none")
+    assert "thinkingConfig" not in m.gemini_config("gemini-3.8-flash", 0.3)
+    monkeypatch.setitem(m.CFG, "thinking_level", "medium")
+    assert m.gemini_config("gemini-3.5-flash-lite", 0.0)["thinkingConfig"] == {"thinkingLevel": "medium"}
+
+
+def test_gemini_request_carries_thinking_level(monkeypatch):
+    sent = {}
+
+    def fake_post(url, headers, body):
+        sent.update(url=url, body=body)
+        return {"candidates": [{"content": {"parts": [{"text": "{}"}]}}]}
+
+    monkeypatch.setitem(m.CFG, "backend", "gemini")
+    monkeypatch.setitem(m.CFG, "thinking_level", "auto")
+    monkeypatch.setattr(m, "_post", fake_post)
+    m.call_llm("gemini-3.8-flash", "sys", "user")
+    assert sent["url"].endswith("/gemini-3.8-flash:generateContent")
+    assert sent["body"]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}

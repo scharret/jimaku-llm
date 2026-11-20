@@ -25,12 +25,14 @@ import random
 import re
 import sqlite3
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from pathlib import Path
 
 import requests
 
-from . import metrics
+from . import budget, metrics
 
 log = logging.getLogger("subtrans")
 
@@ -48,6 +50,13 @@ def env(name, default=None, cast=str):
 CFG = dict(
     backend=env("BACKEND", "gemini"),                 # gemini | openai | anthropic | dummy
     models=[m.strip() for m in env("MODELS", "gemini-3.8-flash").split(",") if m.strip()],
+    # Per target language overrides: MODELS_JA=gemini-3.8-flash, MODELS_FR=gemini-3.5-flash-lite...
+    models_by_lang={k[len("MODELS_"):].lower(): [m.strip() for m in v.split(",") if m.strip()]
+                    for k, v in os.environ.items() if k.startswith("MODELS_") and v.strip()},
+    ocr_models=[m.strip() for m in env("OCR_MODELS", "").split(",") if m.strip()],
+    # Gemini 3 reasoning effort: auto (low, except *-lite models which keep their minimal default),
+    # none (don't send the parameter), or minimal / low / medium / high for every model.
+    thinking_level=env("THINKING_LEVEL", "auto").lower(),
     api_key=env("API_KEY", ""),
     openai_base=env("OPENAI_BASE_URL", "http://ollama:11434/v1"),
     targets=[t.strip() for t in env("TARGET_LANGS", "fr,ja").split(",") if t.strip()],
@@ -58,7 +67,10 @@ CFG = dict(
     context=env("CONTEXT_CUES", 8, int),
     max_retries=env("MAX_RETRIES", 6, int),
     max_backoff=env("MAX_BACKOFF_S", 300, int),
-    min_interval=env("MIN_INTERVAL_S", 1.0, float),   # simple rate limit between requests
+    min_interval=env("MIN_INTERVAL_S", 1.0, float),   # minimum spacing between requests (all workers)
+    max_rpm=env("MAX_RPM", 0, int),                   # global requests/minute cap (0 = MIN_INTERVAL_S only)
+    workers=env("WORKERS", 1, int),                   # videos processed in parallel during a scan
+    parallel_langs=env("PARALLEL_LANGS", "1") == "1", # translate the target languages of a video concurrently
     cache=env("CACHE_DB", "/cache/subtrans.db"),
     libs=[p for p in env("LIBRARY_PATHS", "/media").split(":") if p],
     settle=env("SETTLE_S", 120, int),                 # skip files modified too recently
@@ -75,6 +87,12 @@ CFG = dict(
     metrics_port=env("METRICS_PORT", 9108, int),
     # OCR of image-based PGS (Blu-ray) subtitles: Tesseract locally, a vision LLM for OCR_VISION_LANGS.
     ocr=env("OCR", "1") == "1",
+    # Gemini media resolution for OCR images: low (~280 tokens/image), medium, high, or "" (API default,
+    # ~1120 tokens/image on Gemini 3). Subtitle strips are plain text: low is usually enough.
+    ocr_media_resolution=env("OCR_MEDIA_RESOLUTION", "low").lower(),
+    # Estimated USD per UTC day; once reached, no new LLM request is sent until tomorrow (0 = no limit).
+    daily_budget_usd=env("DAILY_BUDGET_USD", 1.0, float),
+    prices=budget.parse_prices(env("PRICES", "")),
     ocr_vision_langs=[x.strip() for x in env("OCR_VISION_LANGS", "ja").split(",") if x.strip()],   # 0 = disabled; only served in scan --watch mode
     video_exts=[e.strip().lower() for e in env("VIDEO_EXTS", ".mkv,.mp4,.m4v,.avi").split(",")],
 )
@@ -106,12 +124,26 @@ def render_srt(cues):
 
 # ---------------------------------------------------------------- cache
 class Cache:
+    """SQLite cache, one connection per thread (WAL mode so workers don't block each other)."""
+
     def __init__(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
+        self.path = path
+        self._local = threading.local()
+        self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS status (path TEXT PRIMARY KEY, state TEXT, "
                         "reason TEXT, detail TEXT, updated REAL)")
+        self.db.commit()
+
+    @property
+    def db(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, timeout=30)
+            conn.execute("PRAGMA busy_timeout=30000")
+            self._local.conn = conn
+        return conn
 
     def get(self, k):
         row = self.db.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
@@ -168,17 +200,29 @@ class ModelUnavailable(Exception):
 _dead_models = set()
 
 
-_last_call = [0.0]
+_rate_lock = threading.Lock()
+_next_slot = [0.0]       # earliest time the next request may start (shared by all workers)
+_cooldown_until = [0.0]  # set on 429/5xx: every worker backs off, not just the one that got it
+_stop = threading.Event()  # set on ProviderBusy: workers stop picking up new work
 
 
 def _throttle():
-    wait = CFG["min_interval"] - (time.time() - _last_call[0])
-    if wait > 0:
-        time.sleep(wait)
-    _last_call[0] = time.time()
+    interval = max(CFG["min_interval"], 60.0 / CFG["max_rpm"] if CFG["max_rpm"] else 0.0)
+    with _rate_lock:
+        now = time.time()
+        slot = max(now, _next_slot[0], _cooldown_until[0])
+        _next_slot[0] = slot + interval
+    if slot > now:
+        time.sleep(slot - now)
+
+
+def cooldown(seconds):
+    with _rate_lock:
+        _cooldown_until[0] = max(_cooldown_until[0], time.time() + seconds)
 
 
 def _post(url, headers, body):
+    _check_budget()
     _throttle()
     try:
         r = requests.post(url, headers=headers, json=body, timeout=CFG["timeout"])
@@ -201,11 +245,44 @@ def _post(url, headers, body):
     return r.json()
 
 
-def _tokens(model, inp, out):
+def models_for(lang):
+    return CFG["models_by_lang"].get(lang) or CFG["models"]
+
+
+def ocr_models_for(lang):
+    return CFG["ocr_models"] or models_for(lang)
+
+
+def gemini_config(model, temperature):
+    cfg = {"temperature": temperature, "responseMimeType": "application/json"}
+    level = CFG["thinking_level"]
+    if level == "auto":
+        level = "" if "lite" in model else "low"
+    if level and level != "none":
+        cfg["thinkingConfig"] = {"thinkingLevel": level}
+    return cfg
+
+
+class BudgetExceeded(ProviderBusy):
+    """Daily budget reached: stop like a busy provider, resume tomorrow."""
+
+
+def _check_budget():
+    limit = CFG["daily_budget_usd"]
+    if limit and budget.spent_today(CFG["cache"]) >= limit:
+        raise BudgetExceeded(f"daily budget reached ({budget.spent_today(CFG['cache']):.2f} / {limit:.2f} USD, "
+                             "resets at 00:00 UTC)")
+
+
+def _tokens(model, inp, out, thoughts=0):
+    inp, out = int(inp or 0), int(out or 0) + int(thoughts or 0)  # thinking is billed as output
     if inp:
         metrics.inc("jimaku_llm_tokens_total", inp, model=model, kind="input")
     if out:
         metrics.inc("jimaku_llm_tokens_total", out, model=model, kind="output")
+    if inp or out:
+        usd = budget.record(CFG["cache"], model, inp, out, CFG["prices"])
+        metrics.inc("jimaku_llm_cost_usd_total", usd, model=model)
 
 
 def call_llm(model, system, user):
@@ -216,9 +293,9 @@ def call_llm(model, system, user):
             {"x-goog-api-key": CFG["api_key"], "Content-Type": "application/json"},
             {"systemInstruction": {"parts": [{"text": system}]},
              "contents": [{"role": "user", "parts": [{"text": user}]}],
-             "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"}})
+             "generationConfig": gemini_config(model, 0.3)})
         u = data.get("usageMetadata") or {}
-        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"))
+        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"), u.get("thoughtsTokenCount"))
         try:
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError):
@@ -246,6 +323,14 @@ def call_llm(model, system, user):
     raise ValueError(f"unknown BACKEND: {b}")
 
 
+def vision_config():
+    cfg = {"temperature": 0.0, "responseMimeType": "application/json"}
+    res = CFG["ocr_media_resolution"]
+    if res in ("low", "medium", "high"):
+        cfg["mediaResolution"] = f"MEDIA_RESOLUTION_{res.upper()}"
+    return cfg
+
+
 def call_vision(model, prompt, items):
     """items: [(id, png_bytes)]. Returns the raw model text (JSON expected)."""
     from .ocr import b64
@@ -258,9 +343,9 @@ def call_vision(model, prompt, items):
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             {"x-goog-api-key": CFG["api_key"], "Content-Type": "application/json"},
             {"contents": [{"role": "user", "parts": parts}],
-             "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"}})
+             "generationConfig": gemini_config(model, 0.0)})
         u = data.get("usageMetadata") or {}
-        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"))
+        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"), u.get("thoughtsTokenCount"))
         try:
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError):
@@ -306,7 +391,7 @@ def vision_batch(lang, items, cache):
         return hit
     ids = {k for k, _ in items}
     last_err = None
-    for model in CFG["models"]:
+    for model in ocr_models_for(lang):
         if model in _dead_models:
             continue
         for attempt in range(CFG["max_retries"]):
@@ -333,10 +418,13 @@ def vision_batch(lang, items, cache):
                 delay = min(CFG["max_backoff"], (e.retry_after if isinstance(e, Overloaded) and e.retry_after
                                                  else 15 * 2 ** attempt if getattr(e, "quota", False)
                                                  else 2 ** attempt * 2)) + random.uniform(0, 1.5)
+                if isinstance(e, Overloaded):
+                    cooldown(delay)
                 log.warning("%s OCR batch: %s (attempt %d/%d, waiting %.0fs)", model, e, attempt + 1,
                             CFG["max_retries"], delay)
                 time.sleep(delay)
     if isinstance(last_err, Overloaded):
+        _stop.set()
         raise ProviderBusy(f"all models overloaded or out of quota ({last_err})")
     raise RuntimeError(f"OCR batch failed: {last_err}")
 
@@ -370,6 +458,8 @@ def system_prompt(lang, glossary, src_lang="en"):
 
 
 def translate_batch(batch, ctx, lang, glossary, cache, src_lang="en"):
+    if _stop.is_set():
+        raise ProviderBusy("stopped: another worker found the provider busy")
     src = {str(i): t for i, _, t in batch}
     key_parts = [PROMPT_VERSION, lang, glossary, ctx, src] + ([src_lang] if src_lang != "en" else [])
     key = hashlib.sha256(json.dumps(key_parts, ensure_ascii=False).encode()).hexdigest()
@@ -382,7 +472,8 @@ def translate_batch(batch, ctx, lang, glossary, cache, src_lang="en"):
             + "\n".join(f"{s} => {t}" for s, t in ctx)
             + "\n\nTRANSLATE:\n" + json.dumps(src, ensure_ascii=False))
     last_err = None
-    for model in CFG["models"]:
+    models = models_for(lang)
+    for model in models:
         if model in _dead_models:
             continue
         for attempt in range(CFG["max_retries"]):
@@ -421,15 +512,18 @@ def translate_batch(batch, ctx, lang, glossary, cache, src_lang="en"):
                 else:
                     delay = min(CFG["max_backoff"], 2 ** attempt * 2)
                 delay += random.uniform(0, 1.5)
+                if isinstance(e, Overloaded):
+                    cooldown(delay)
                 log.warning("%s batch %s-%s: %s (attempt %d/%d, waiting %.0fs)", model, batch[0][0],
                             batch[-1][0], e, attempt + 1, CFG["max_retries"], delay)
                 time.sleep(delay)
         if model not in _dead_models:
             log.warning("giving up on %s for batch %s-%s", model, batch[0][0], batch[-1][0])
-    if all(m in _dead_models for m in CFG["models"]):
-        raise RuntimeError(f"no usable model in MODELS={CFG['models']}: {last_err}")
+    if all(m in _dead_models for m in models):
+        raise RuntimeError(f"no usable model for {lang} (MODELS{'_' + lang.upper() if lang in CFG['models_by_lang'] else ''}={models}): {last_err}")
     if isinstance(last_err, Overloaded):
         # Capacity/quota problem: splitting the batch would only multiply requests. Stop and resume later.
+        _stop.set()
         raise ProviderBusy(f"all models overloaded or out of quota ({last_err})")
     # Broken output: split the batch in half (large batches break the JSON more often)
     if len(batch) > 8:
@@ -448,7 +542,7 @@ def load_glossary(srt_path):
     return "\n".join(parts)
 
 
-def translate_file(src_path, lang, cache, src_lang="en"):
+def translate_file(src_path, lang, cache, src_lang="en", label=""):
     cues = parse_srt(src_path)
     glossary = load_glossary(src_path)
     out, ctx = {}, []
@@ -457,7 +551,7 @@ def translate_file(src_path, lang, cache, src_lang="en"):
         res = translate_batch(batch, ctx[-CFG["context"]:], lang, glossary, cache, src_lang)
         out.update(res)
         ctx += [(t, res[str(n)]) for n, _, t in batch]
-        log.info("  %s: %d/%d", lang, min(i + CFG["batch"], len(cues)), len(cues))
+        log.info("  %s%s: %d/%d", f"{label[:40]} " if label else "", lang, min(i + CFG["batch"], len(cues)), len(cues))
     return [(n, tc, out[str(n)]) for n, tc, _ in cues]
 
 
@@ -686,16 +780,23 @@ def handle(path: Path, cache, force=False):
                       "Check the file or raise MAX_CUES.", base.name, src.name, n_cues, CFG["max_cues"])
             problem = ("too_many_cues", f"{src.name}: {n_cues} cues > MAX_CUES={CFG['max_cues']}")
         else:
-            for lang in todo:
-                if lang == src_lang:
-                    continue
-                dst = Path(f"{base}.{lang}.srt")
+            langs = [lg for lg in todo if lg != src_lang]
+
+            def one(lang):
                 log.info("translating %s (%s) -> %s", base.name, src_lang, lang)
                 t0 = time.time()
-                cues = translate_file(src, lang, cache, src_lang)
+                return lang, translate_file(src, lang, cache, src_lang, label=base.name), time.time() - t0
+
+            if CFG["parallel_langs"] and len(langs) > 1:
+                with ThreadPoolExecutor(max_workers=len(langs), thread_name_prefix="lang") as ex:
+                    results = list(ex.map(one, langs))  # re-raises the first worker exception
+            else:
+                results = [one(lg) for lg in langs]
+            for lang, cues, elapsed in results:
+                dst = Path(f"{base}.{lang}.srt")
                 write_atomic(dst, render_srt(cues))
                 mark_ours(dst, cache)
-                log.info("wrote %s (%.0fs)", dst.name, time.time() - t0)
+                log.info("wrote %s (%.0fs)", dst.name, elapsed)
                 written.append(f"{lang} (from {src_lang})")
                 metrics.inc("jimaku_files_written_total", kind=f"{lang}.srt")
                 did = True
@@ -731,24 +832,47 @@ def handle(path: Path, cache, force=False):
 def scan(cache, force=False):
     now = time.time()
     t_start = now
-    n_ok = n_err = 0
+    _stop.clear()
+    videos = []
     for lib in CFG["libs"]:
         for p in sorted(Path(lib).rglob("*")):
             if p.suffix.lower() not in CFG["video_exts"] or not p.is_file():
                 continue
             if now - p.stat().st_mtime < CFG["settle"]:
                 continue  # still being copied/remuxed
-            try:
-                if handle(p, cache, force):
-                    n_ok += 1
-            except ProviderBusy as e:  # hitting the next files would fail the same way
-                cache.set_status(p, "failed", "provider_busy", str(e)[:300])
-                log.error("stopping scan: %s; progress is cached, next scan resumes", e)
-                return n_err + 1
-            except Exception as e:  # one failing file must not block the rest
-                n_err += 1
-                cache.set_status(p, "failed", "error", f"{type(e).__name__}: {e}"[:300])
-                log.error("failed %s: %s", p, e)
+            videos.append(p)
+
+    def work(p):
+        """Returns 'ok', 'noop', 'error' or 'busy'."""
+        if _stop.is_set():
+            return "busy"
+        metrics.inc_gauge("jimaku_active_tasks", 1)
+        try:
+            return "ok" if handle(p, cache, force) else "noop"
+        except ProviderBusy as e:  # every worker stops: the next files would fail the same way
+            _stop.set()
+            cache.set_status(p, "failed", "provider_busy", str(e)[:300])
+            return "busy"
+        except Exception as e:  # one failing file must not block the rest
+            cache.set_status(p, "failed", "error", f"{type(e).__name__}: {e}"[:300])
+            log.error("failed %s: %s", p, e)
+            return "error"
+        finally:
+            metrics.inc_gauge("jimaku_active_tasks", -1)
+
+    if CFG["workers"] > 1:
+        with ThreadPoolExecutor(max_workers=CFG["workers"], thread_name_prefix="video") as ex:
+            outcomes = list(ex.map(work, videos))
+    else:
+        outcomes = []
+        for p in videos:
+            outcomes.append(work(p))
+            if _stop.is_set():
+                break
+    n_ok, n_err = outcomes.count("ok"), outcomes.count("error")
+    if _stop.is_set():
+        log.error("stopping scan: provider busy or out of quota; progress is cached, next scan resumes")
+        return n_err + 1
     summary = cache.db.execute("SELECT state || '/' || reason, COUNT(*) FROM status "
                                "WHERE state != 'done' GROUP BY 1 ORDER BY 2 DESC").fetchall()
     metrics.set_gauge("jimaku_scan_duration_seconds", time.time() - t_start)
@@ -792,15 +916,24 @@ def main(argv=None):
     r.add_argument("--reason", help="e.g. too_many_cues, no_source, image_subs_only, audio_language")
     r.add_argument("--all", action="store_true", help="include done and audio_language rows")
     r.add_argument("--json", action="store_true")
+    sub.add_parser("usage", help="estimated LLM spend per day and model (last 7 days)")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     if a.cmd == "report":
         return report(Cache(CFG["cache"]), a)
+    if a.cmd == "usage":
+        Cache(CFG["cache"])  # make sure the DB exists
+        print(f"today ({budget.today()} UTC): {budget.spent_today(CFG['cache']):.3f} USD"
+              f" / budget {CFG['daily_budget_usd'] or 'unlimited'}")
+        for day, model, inp, out, usd in budget.summary(CFG["cache"]):
+            print(f"{day}  {model:<28} in={inp:>10,} out={out:>9,}  {usd:7.3f} USD")
+        return 0
     if CFG["backend"] not in ("dummy", "openai") and not CFG["api_key"]:
         sys.exit("API_KEY is missing")
     cache = Cache(CFG["cache"])
     if a.cmd == "file":
+        _stop.clear()
         try:
             handle(Path(a.path), cache, a.force)
         except ProviderBusy as e:

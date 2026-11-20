@@ -93,11 +93,47 @@ The Kubernetes CronJob runs one-shot scans and does not expose metrics.
 | `jimaku_cues_translated_total` | counter | `lang` |
 | `jimaku_files_written_total` | counter | `kind` (e.g. `fr.srt`, `ja.ass`) |
 | `jimaku_ocr_cues_total` | counter | `lang`, `engine` = tesseract / vision |
+| `jimaku_active_tasks` | gauge | |
 | `jimaku_videos` | gauge | `state`, `reason` (same as `subtrans report`, persisted) |
 | `jimaku_scan_duration_seconds`, `jimaku_scan_last_success_timestamp_seconds` | gauge | |
 
 Counters reset on restart (use `increase()`/`rate()`). Scrape config and alert rules
 (stale scan, quota exhausted, high failure ratio, skipped files) are in [`deploy/prometheus/`](deploy/prometheus/).
+
+## Choosing models
+
+Quality matters most where you learn from the output. A sensible split on Gemini:
+
+```yaml
+MODELS: gemini-3.5-flash-lite,gemini-3.8-flash      # default (French): cheap and fast
+MODELS_JA: gemini-3.8-flash,gemini-3.5-flash-lite   # Japanese: better quality for study
+OCR_MODELS: gemini-3.8-flash                        # reading kanji from images
+THINKING_LEVEL: auto
+```
+
+Reasoning models default to a high/medium thinking level: slow (minutes per batch) and billed as output
+tokens. Subtitle translation needs little reasoning, hence `THINKING_LEVEL=auto` (`low`). Check the real cost
+with `jimaku_llm_tokens_total`.
+
+## Parallelism
+
+Batches of one video stay sequential (each batch gets the previous translations as context, which keeps
+names and register consistent). What runs in parallel: the target languages of a video (`PARALLEL_LANGS`)
+and several videos (`WORKERS`). All workers share one rate limiter (`MAX_RPM` / `MIN_INTERVAL_S`), a 429/5xx
+puts **every** worker on cooldown, and a `ProviderBusy` stops them all. Example for a paid Gemini key:
+`WORKERS=3 MAX_RPM=60`.
+## Cost control
+
+Every response's token usage (thinking included) is priced with a built-in table (overridable with `PRICES`)
+and stored per UTC day in the cache DB. When `DAILY_BUDGET_USD` is reached, the run stops like a busy
+provider and resumes the next day; in-flight requests can overshoot by about one batch.
+
+```bash
+docker compose run --rm subtrans usage      # spend per day and model
+```
+
+Metrics: `jimaku_llm_cost_usd_total{model}`, `jimaku_budget_spent_today_usd`. These are estimates: the
+provider bill (taxes included) is the source of truth.
 
 ## Reliability
 
@@ -152,9 +188,15 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `BACKEND` | `gemini` | `gemini` \| `anthropic` \| `openai` \| `dummy` (offline tests) |
 | `API_KEY` | — | not needed for a local OpenAI-compatible server |
 | `MODELS` | `gemini-3.8-flash` | comma-separated, tried in order |
+| `MODELS_<LANG>` | — | per target language override, e.g. `MODELS_JA=gemini-3.8-flash`, `MODELS_FR=gemini-3.5-flash-lite` |
+| `OCR_MODELS` | — | vision models for OCR (default: the target language's models) |
+| `THINKING_LEVEL` | `auto` | Gemini 3 reasoning effort: `auto` (= `low`, `*-lite` models keep their default), `none`, `minimal`, `low`, `medium`, `high` |
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
 | `OCR` | `1` | OCR image-based PGS tracks |
+| `OCR_MEDIA_RESOLUTION` | `low` | Gemini image resolution for OCR: `low` (~280 tokens/image), `medium`, `high`, empty = API default (~1120 tokens/image on Gemini 3) |
+| `DAILY_BUDGET_USD` | `1.0` | estimated spend per UTC day; once reached, no new request until 00:00 UTC (`0` = unlimited) |
+| `PRICES` | built-in | override the price table, USD per 1M tokens: `model=in/out,model2=in/out` |
 | `OCR_VISION_LANGS` | `ja` | languages OCR'd with the vision LLM (others: Tesseract) |
 | `METRICS_PORT` | `9108` | `/metrics` in `scan --watch` mode; `0` disables |
 | `MAX_CUES` | `5000` | safety net: sources with more cues are skipped (runaway effects, broken files) |
@@ -166,7 +208,10 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `FURIGANA` | `1` | generate `.ja.ass` |
 | `FURIGANA_STRIP_SDH` | `1` | drop hearing-impaired annotations (`［銃声］`, `（ため息）`, speaker names, `♪`) from the furigana ASS |
 | `BATCH_SIZE` / `CONTEXT_CUES` | `60` / `8` | |
-| `MAX_RETRIES` / `MIN_INTERVAL_S` | `6` / `1.0` | per model / seconds between requests |
+| `MAX_RETRIES` / `MIN_INTERVAL_S` | `6` / `1.0` | per model / minimum seconds between two requests (all workers) |
+| `MAX_RPM` | `0` | global requests/minute cap shared by all workers (`0` = `MIN_INTERVAL_S` only) |
+| `WORKERS` | `1` | videos processed in parallel during a scan |
+| `PARALLEL_LANGS` | `1` | translate the target languages of a video concurrently |
 | `MAX_BACKOFF_S` | `300` | longest wait between retries |
 | `HTTP_TIMEOUT_S` | `180` | raise it for slow "thinking" models |
 | `LIBRARY_PATHS` | `/media` | `:`-separated |
