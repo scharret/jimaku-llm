@@ -581,8 +581,18 @@ def ocr_source(lang, base: Path, video: Path, streams, cache: Cache):
     if dest.exists() and dest.stat().st_mtime >= video.stat().st_mtime:
         return dest
     log.info("OCR of embedded %s PGS stream #%s from %s (%s)", lang, pgs[0]["index"], video.name, engine)
-    srt = ocr_track(video, pgs[0]["index"], lang, engine,
-                    call_vision=lambda lg, items: vision_batch(lg, items, cache))
+    from .ocr import TooManyImages
+    st = video.stat()
+    big_key = f"ocr_too_many:{lang}:{video}:{st.st_size}:{int(st.st_mtime)}"
+    if cache.get(big_key):
+        raise TooManyImages(cache.get(big_key))  # known: don't re-read the file every scan
+    try:
+        srt = ocr_track(video, pgs[0]["index"], lang, engine,
+                        call_vision=lambda lg, items: vision_batch(lg, items, cache),
+                        max_images=CFG["max_cues"])
+    except TooManyImages as e:
+        cache.put(big_key, str(e))
+        raise
     n = srt.count(" --> ")
     metrics.inc("jimaku_ocr_cues_total", n, lang=lang, engine=engine)
     if not n:

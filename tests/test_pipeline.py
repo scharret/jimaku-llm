@@ -481,3 +481,27 @@ def test_pgs_japanese_uses_vision_and_is_not_translated(tmp_path):
     ass = (d / "Film.ja.ass").read_text(encoding="utf-8-sig")
     assert "[vision a] 1" in ass                       # furigana built from the OCR'd Japanese (vision engine)
     assert (d / "Film.fr.srt").exists()                # French still translated (from OCR'd English)
+
+
+@needs_tesseract
+def test_pgs_repeated_display_sets_are_merged():
+    from subtrans.ocr import ocr_tesseract, parse_sup, render
+    sets = list(parse_sup(encode_pgs(PGS_SUBS, LATIN_FONT, repeats=5)))
+    assert len(sets) == 2                                      # not 2 x 6 images
+    assert round(sets[0][0], 2) == 1.0 and round(sets[0][1], 2) == 2.5
+    texts = ocr_tesseract([render(objs) for _, _, objs in sets], "en")
+    assert "Conan" in texts[0]                                 # opaque palette kept, not the faded one
+
+
+@needs_ffmpeg
+def test_ocr_image_cap(tmp_path, monkeypatch):
+    if not os.path.exists(LATIN_FONT):
+        pytest.skip("font missing")
+    monkeypatch.setitem(m.CFG, "max_cues", 1)
+    d = film_dir(tmp_path)
+    video = mux_pgs(tmp_path, d / "Film.mkv", "jpn", [(encode_pgs(PGS_SUBS, LATIN_FONT), "jpn")])
+    calls = []
+    monkeypatch.setattr(m, "call_vision", lambda *a: calls.append(a) or "{}")
+    with pytest.raises(Exception, match="MAX_CUES"):
+        m.handle(video, cache())
+    assert calls == []                                         # nothing sent to the API
