@@ -30,6 +30,17 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 1
+      # Lets Claude run the test suite (ffmpeg/Tesseract tests are skipped here; CI runs them).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install requests "fugashi[unidic-lite]" pillow pytest
       - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # gh pr create runs with the app token, so PRs are opened by the Claude app, not the owner,
+          # and the owner can approve them. Merging stays with the owner (no gh pr merge).
+          claude_args: |
+            --allowedTools "Bash(gh pr create:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(pytest:*),Bash(python -m pytest:*)"
