@@ -542,6 +542,45 @@ def test_ocr_image_cap(tmp_path, monkeypatch):
     assert calls == []                                         # nothing sent to the API
 
 
+# ---------------------------------------------------------------- budget / media resolution
+def test_ocr_media_resolution(monkeypatch):
+    monkeypatch.setitem(m.CFG, "ocr_media_resolution", "low")
+    assert m.vision_config()["mediaResolution"] == "MEDIA_RESOLUTION_LOW"
+    monkeypatch.setitem(m.CFG, "ocr_media_resolution", "")
+    assert "mediaResolution" not in m.vision_config()
+
+
+def test_cost_and_unknown_model_price():
+    from subtrans import budget
+    prices = budget.parse_prices("my-model=1/10")
+    assert budget.cost("gemini-3.5-flash-lite", 1_000_000, 0, prices) == pytest.approx(0.30)
+    assert budget.cost("my-model", 1_000_000, 1_000_000, prices) == pytest.approx(11.0)
+    assert budget.cost("never-heard-of", 1_000_000, 0, prices) == pytest.approx(1.50)
+
+
+def test_daily_budget_blocks_requests(tmp_path, monkeypatch):
+    sent = []
+
+    class Resp:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": "{}"}]}}],
+                    "usageMetadata": {"promptTokenCount": 500_000, "candidatesTokenCount": 100_000,
+                                      "thoughtsTokenCount": 100_000}}
+
+    monkeypatch.setattr(m.requests, "post", lambda *a, **k: sent.append(1) or Resp())
+    monkeypatch.setitem(m.CFG, "backend", "gemini")
+    monkeypatch.setitem(m.CFG, "daily_budget_usd", 0.5)
+    cache()  # create the DB
+    m.call_llm("gemini-3.5-flash-lite", "s", "u")   # 0.5M*0.30 + 0.2M*2.50 = 0.65 USD
+    from subtrans import budget
+    assert budget.spent_today(m.CFG["cache"]) == pytest.approx(0.65)
+    with pytest.raises(m.BudgetExceeded):
+        m.call_llm("gemini-3.5-flash-lite", "s", "u")
+    assert len(sent) == 1                             # the second request never left
+    assert m.main(["usage"]) == 0
 def test_vision_prompt_ignores_furigana_for_japanese():
     from subtrans.ocr import vision_prompt
     assert "furigana" in vision_prompt("ja")

@@ -30,7 +30,7 @@ from pathlib import Path
 
 import requests
 
-from . import metrics
+from . import budget, metrics
 
 log = logging.getLogger("subtrans")
 
@@ -75,6 +75,12 @@ CFG = dict(
     metrics_port=env("METRICS_PORT", 9108, int),
     # OCR of image-based PGS (Blu-ray) subtitles: Tesseract locally, a vision LLM for OCR_VISION_LANGS.
     ocr=env("OCR", "1") == "1",
+    # Gemini media resolution for OCR images: low (~280 tokens/image), medium, high, or "" (API default,
+    # ~1120 tokens/image on Gemini 3). Subtitle strips are plain text: low is usually enough.
+    ocr_media_resolution=env("OCR_MEDIA_RESOLUTION", "low").lower(),
+    # Estimated USD per UTC day; once reached, no new LLM request is sent until tomorrow (0 = no limit).
+    daily_budget_usd=env("DAILY_BUDGET_USD", 1.0, float),
+    prices=budget.parse_prices(env("PRICES", "")),
     ocr_vision_langs=[x.strip() for x in env("OCR_VISION_LANGS", "ja").split(",") if x.strip()],   # 0 = disabled; only served in scan --watch mode
     video_exts=[e.strip().lower() for e in env("VIDEO_EXTS", ".mkv,.mp4,.m4v,.avi").split(",")],
 )
@@ -179,6 +185,7 @@ def _throttle():
 
 
 def _post(url, headers, body):
+    _check_budget()
     _throttle()
     try:
         r = requests.post(url, headers=headers, json=body, timeout=CFG["timeout"])
@@ -201,11 +208,26 @@ def _post(url, headers, body):
     return r.json()
 
 
-def _tokens(model, inp, out):
+class BudgetExceeded(ProviderBusy):
+    """Daily budget reached: stop like a busy provider, resume tomorrow."""
+
+
+def _check_budget():
+    limit = CFG["daily_budget_usd"]
+    if limit and budget.spent_today(CFG["cache"]) >= limit:
+        raise BudgetExceeded(f"daily budget reached ({budget.spent_today(CFG['cache']):.2f} / {limit:.2f} USD, "
+                             "resets at 00:00 UTC)")
+
+
+def _tokens(model, inp, out, thoughts=0):
+    inp, out = int(inp or 0), int(out or 0) + int(thoughts or 0)  # thinking is billed as output
     if inp:
         metrics.inc("jimaku_llm_tokens_total", inp, model=model, kind="input")
     if out:
         metrics.inc("jimaku_llm_tokens_total", out, model=model, kind="output")
+    if inp or out:
+        usd = budget.record(CFG["cache"], model, inp, out, CFG["prices"])
+        metrics.inc("jimaku_llm_cost_usd_total", usd, model=model)
 
 
 def call_llm(model, system, user):
@@ -218,7 +240,7 @@ def call_llm(model, system, user):
              "contents": [{"role": "user", "parts": [{"text": user}]}],
              "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"}})
         u = data.get("usageMetadata") or {}
-        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"))
+        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"), u.get("thoughtsTokenCount"))
         try:
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError):
@@ -246,6 +268,14 @@ def call_llm(model, system, user):
     raise ValueError(f"unknown BACKEND: {b}")
 
 
+def vision_config():
+    cfg = {"temperature": 0.0, "responseMimeType": "application/json"}
+    res = CFG["ocr_media_resolution"]
+    if res in ("low", "medium", "high"):
+        cfg["mediaResolution"] = f"MEDIA_RESOLUTION_{res.upper()}"
+    return cfg
+
+
 def call_vision(model, prompt, items):
     """items: [(id, png_bytes)]. Returns the raw model text (JSON expected)."""
     from .ocr import b64
@@ -258,9 +288,9 @@ def call_vision(model, prompt, items):
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             {"x-goog-api-key": CFG["api_key"], "Content-Type": "application/json"},
             {"contents": [{"role": "user", "parts": parts}],
-             "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"}})
+             "generationConfig": vision_config()})
         u = data.get("usageMetadata") or {}
-        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"))
+        _tokens(model, u.get("promptTokenCount"), u.get("candidatesTokenCount"), u.get("thoughtsTokenCount"))
         try:
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError):
@@ -792,11 +822,19 @@ def main(argv=None):
     r.add_argument("--reason", help="e.g. too_many_cues, no_source, image_subs_only, audio_language")
     r.add_argument("--all", action="store_true", help="include done and audio_language rows")
     r.add_argument("--json", action="store_true")
+    sub.add_parser("usage", help="estimated LLM spend per day and model (last 7 days)")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     if a.cmd == "report":
         return report(Cache(CFG["cache"]), a)
+    if a.cmd == "usage":
+        Cache(CFG["cache"])  # make sure the DB exists
+        print(f"today ({budget.today()} UTC): {budget.spent_today(CFG['cache']):.3f} USD"
+              f" / budget {CFG['daily_budget_usd'] or 'unlimited'}")
+        for day, model, inp, out, usd in budget.summary(CFG["cache"]):
+            print(f"{day}  {model:<28} in={inp:>10,} out={out:>9,}  {usd:7.3f} USD")
+        return 0
     if CFG["backend"] not in ("dummy", "openai") and not CFG["api_key"]:
         sys.exit("API_KEY is missing")
     cache = Cache(CFG["cache"])

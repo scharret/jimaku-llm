@@ -99,6 +99,19 @@ The Kubernetes CronJob runs one-shot scans and does not expose metrics.
 Counters reset on restart (use `increase()`/`rate()`). Scrape config and alert rules
 (stale scan, quota exhausted, high failure ratio, skipped files) are in [`deploy/prometheus/`](deploy/prometheus/).
 
+## Cost control
+
+Every response's token usage (thinking included) is priced with a built-in table (overridable with `PRICES`)
+and stored per UTC day in the cache DB. When `DAILY_BUDGET_USD` is reached, the run stops like a busy
+provider and resumes the next day; in-flight requests can overshoot by about one batch.
+
+```bash
+docker compose run --rm subtrans usage      # spend per day and model
+```
+
+Metrics: `jimaku_llm_cost_usd_total{model}`, `jimaku_budget_spent_today_usd`. These are estimates: the
+provider bill (taxes included) is the source of truth.
+
 ## Reliability
 
 - **Idempotent**: an existing output is never overwritten (`--force` to redo). A human-made subtitle
@@ -155,6 +168,9 @@ Bamboo copter => タケコプター / hélicoptère de bambou
 | `OPENAI_BASE_URL` | `http://ollama:11434/v1` | `openai` backend only |
 | `TARGET_LANGS` | `fr,ja` | |
 | `OCR` | `1` | OCR image-based PGS tracks |
+| `OCR_MEDIA_RESOLUTION` | `low` | Gemini image resolution for OCR: `low` (~280 tokens/image), `medium`, `high`, empty = API default (~1120 tokens/image on Gemini 3) |
+| `DAILY_BUDGET_USD` | `1.0` | estimated spend per UTC day; once reached, no new request until 00:00 UTC (`0` = unlimited) |
+| `PRICES` | built-in | override the price table, USD per 1M tokens: `model=in/out,model2=in/out` |
 | `OCR_VISION_LANGS` | `ja` | languages OCR'd with the vision LLM (others: Tesseract) |
 | `METRICS_PORT` | `9108` | `/metrics` in `scan --watch` mode; `0` disables |
 | `MAX_CUES` | `5000` | safety net: sources with more cues are skipped (runaway effects, broken files) |
